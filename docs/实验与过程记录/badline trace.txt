@@ -1,0 +1,200 @@
+import cv2
+2import numpy as np
+3from itertools import combinations
+4
+
+5def detect_court_lines(frame, visualize=False):
+6    """
+7    检测羽毛球场的所有白线，返回线段的集合。
+8    适应不同光照、地面颜色、部分遮挡。
+9    """
+10    # 1. 预处理：光照归一化
+11    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+12    l, a, b = cv2.split(lab)
+13    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+14    l_eq = clahe.apply(l)
+15    lab_eq = cv2.merge([l_eq, a, b])
+16    frame_eq = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
+17    gray = cv2.cvtColor(frame_eq, cv2.COLOR_BGR2GRAY)
+18
+
+19    # 2. 自适应阈值（应对不同颜色地面）
+20    thresh = cv2.adaptiveThreshold(
+21        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+22        cv2.THRESH_BINARY_INV, blockSize=31, C=8
+23    )
+24
+
+25    # 3. 形态学操作：连接断裂的线
+26    kernel = np.ones((3, 3), np.uint8)
+27    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+28    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+29
+
+30    # 4. Canny 边缘 + Hough 直线检测
+31    edges = cv2.Canny(thresh, 30, 120)
+32    lines = cv2.HoughLinesP(
+33        edges, rho=1, theta=np.pi/180,
+34        threshold=120, minLineLength=180, maxLineGap=40
+35    )
+36
+
+37    if lines is None:
+38        return []
+39
+
+40    # 5. 过滤与聚类直线
+41    filtered_lines = []
+42    for line in lines:
+43        x1, y1, x2, y2 = line[0]
+44        length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+45        if length < 100:
+46            continue
+47        angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+48        filtered_lines.append((x1, y1, x2, y2, angle, length))
+49
+
+50    # 6. 按角度聚类：水平线、垂直线、斜线
+51    horizontal_lines = []
+52    vertical_lines = []
+53    diagonal_lines = []
+54
+
+55    for (x1, y1, x2, y2, angle, length) in filtered_lines:
+56        if -10 <= angle <= 10 or 170 <= angle <= 180 or -180 <= angle <= -170:
+57            horizontal_lines.append((x1, y1, x2, y2, angle, length))
+58        elif 80 <= angle <= 100 or -100 <= angle <= -80:
+59            vertical_lines.append((x1, y1, x2, y2, angle, length))
+60        else:
+61            diagonal_lines.append((x1, y1, x2, y2, angle, length))
+62
+
+63    result = {
+64        'horizontal': horizontal_lines,
+65        'vertical': vertical_lines,
+66        'diagonal': diagonal_lines,
+67        'all': filtered_lines
+68    }
+69
+
+70    if visualize:
+71        debug = frame.copy()
+72        for (x1, y1, x2, y2, angle, length) in horizontal_lines:
+73            cv2.line(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
+74        for (x1, y1, x2, y2, angle, length) in vertical_lines:
+75            cv2.line(debug, (x1, y1), (x2, y2), (255, 0, 0), 2)
+76        for (x1, y1, x2, y2, angle, length) in diagonal_lines:
+77            cv2.line(debug, (x1, y1), (x2, y2), (0, 0, 255), 2)
+78        cv2.imshow("Court Lines Detected", debug)
+79        cv2.waitKey(0)
+80        cv2.destroyAllWindows()
+81
+
+82    return result
+83
+
+84
+
+85def compute_court_corners(line_groups):
+86    """
+87    根据水平线和垂直线，计算球场 4 个角点 + 中线两端点。
+88    """
+89    h_lines = line_groups['horizontal']
+90    v_lines = line_groups['vertical']
+91
+
+92    if len(h_lines) < 2 or len(v_lines) < 2:
+93        return None  # 检测到的线不够
+94
+
+95    # 用 RANSAC 思想融合多条水平线为两条主水平线（近端边界 + 远端边界）
+96    h_centers = [(y1 + y2) / 2 for (x1, y1, x2, y2, a, l) in h_lines]
+97    h_centers = sorted(h_centers)
+98    
+99    # 用中位数分成两组（近处一组，远处一组）
+100    median_h = np.median(h_centers)
+101    h_group1 = [l for l in h_lines if (l[1] + l[3]) / 2 < median_h]
+102    h_group2 = [l for l in h_lines if (l[1] + l[3]) / 2 >= median_h]
+103
+
+104    # 同样处理垂直线
+105    v_centers = [(x1 + x2) / 2 for (x1, y1, x2, y2, a, l) in v_lines]
+106    v_centers = sorted(v_centers)
+107    median_v = np.median(v_centers)
+108    v_group1 = [l for l in v_lines if (l[0] + l[2]) / 2 < median_v]
+109    v_group2 = [l for l in v_lines if (l[0] + l[2]) / 2 >= median_v]
+110
+
+111    # 融合每组为一条代表性直线
+112    h_top = fuse_line_group(h_group1, is_horizontal=True)
+113    h_bottom = fuse_line_group(h_group2, is_horizontal=True)
+114    v_left = fuse_line_group(v_group1, is_horizontal=False)
+115    v_right = fuse_line_group(v_group2, is_horizontal=False)
+116
+
+117    if None in (h_top, h_bottom, v_left, v_right):
+118        return None
+119
+
+120    # 四条线两两相交，得到 4 个角点
+121    corners = []
+122    for h_line in [h_top, h_bottom]:
+123        for v_line in [v_left, v_right]:
+124            pt = line_intersection(h_line, v_line)
+125            if pt is not None:
+126                corners.append(pt)
+127
+
+128    if len(corners) < 4:
+129        return None
+130
+
+131    # 排序：左上、右上、左下、右下
+132    corners = sorted(corners, key=lambda p: (p[1], p[0]))
+133    top_left = corners[0]
+134    top_right = corners[1]
+135    bottom_left = corners[-2]
+136    bottom_right = corners[-1]
+137
+
+138    return {
+139        'top_left': top_left,
+140        'top_right': top_right,
+141        'bottom_left': bottom_left,
+142        'bottom_right': bottom_right
+143    }
+144
+
+145
+
+146def fuse_line_group(lines, is_horizontal=True):
+147    if len(lines) == 0:
+148        return None
+149    if is_horizontal:
+150        ys = [(l[1] + l[3]) / 2 for l in lines]
+151        xs = [(l[0] + l[2]) / 2 for l in lines]
+152        y_avg = np.mean(ys)
+153        x_min = min(l[0] for l in lines)
+154        x_max = max(l[2] for l in lines)
+155        return (x_min, y_avg, x_max, y_avg)
+156    else:
+157        xs = [(l[0] + l[2]) / 2 for l in lines]
+158        ys = [(l[1] + l[3]) / 2 for l in lines]
+159        x_avg = np.mean(xs)
+160        y_min = min(l[1] for l in lines)
+161        y_max = max(l[3] for l in lines)
+162        return (x_avg, y_min, x_avg, y_max)
+163
+
+164
+
+165def line_intersection(line1, line2):
+166    """计算两条直线的交点（线段形式）"""
+167    x1, y1, x2, y2 = line1
+168    x3, y3, x4, y4 = line2
+169    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+170    if abs(denom) < 1e-6:
+171        return None
+172    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denom
+173    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
+174    return (int(px), int(py))

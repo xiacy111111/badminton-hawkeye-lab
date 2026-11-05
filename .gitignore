@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 大文件 / 模型权重
+*.pt
+*.onnx
+weights/
+videos/
+outputs/
+backups/
+
+# 数据与临时
+*.zip
+req_temp.txt
+微信图片_*
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,499 @@
+"""
+ball_flight_tracker.py — 球飞行轨迹跟踪 + 出画预测
+================
+独立模块，负责处理球飞出画面的情况。
+
+状态机：
+  TRACKING ──(球丢失)──→ LOST ──(超时)──→ EXPIRED
+     │                      │
+     │    ┌────(重捕获)─────┘
+     │    ▼
+     └──→ REACQUIRED ──(匹配成功)──→ TRACKING
+              │
+              └──(匹配失败)──→ EXPIRED
+
+核心功能：
+  1. 卡尔曼滤波平滑在画面内的轨迹
+  2. 抛物线模型预测飞出画面后的运动
+  3. 球重入画面后自动匹配 + 填补丢失帧
+  4. 置信度随时间衰减，超时标记为"数据不足"
+
+集成方式：
+  from trajectory_predictor import TrajectoryPredictor
+  predictor = TrajectoryPredictor(fps=30)
+  
+  for frame in video:
+      x, y = detector.find_ball(frame)  # (x, y) 或 None
+      state = predictor.update(x, y, frame_id)
+      # state 包含：当前状态、平滑位置、预测帧列表等
+"""
+
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional, List, Tuple
+import numpy as np
+
+
+# ============================================================
+# 数据类型
+# ============================================================
+
+class TrackState(Enum):
+    """跟踪状态"""
+    TRACKING = auto()       # 正常跟踪中
+    LOST = auto()           # 刚丢失，开始预测
+    PREDICTING = auto()     # 使用物理模型预测中
+    REACQUIRED = auto()     # 球重新出现，待验证
+    EXPIRED = auto()        # 超时，轨迹终止
+    IDLE = auto()           # 尚未开始跟踪
+
+
+@dataclass
+class PredictedPoint:
+    """预测点"""
+    frame: int
+    x: float
+    y: float
+    is_real: bool = True        # True=真实检测, False=预测填补
+    confidence: float = 1.0     # 1.0=真实, 衰减=预测
+
+
+@dataclass
+class TrackStateReport:
+    """每帧返回的状态报告"""
+    state: TrackState
+    current_position: Optional[Tuple[float, float]]  # 当前帧的球位置（真实或预测）
+    velocity: Optional[Tuple[float, float]]          # 估计速度 (vx, vy) px/frame
+    lost_duration: int                                 # 连续丢失帧数
+    confidence: float                                  # 当前跟踪置信度 0~1
+    gap_fills: List[PredictedPoint] = field(default_factory=list)  # 需要回填的帧
+
+
+# ============================================================
+# 卡尔曼滤波器（画面内平滑）
+# ============================================================
+
+class BallKalmanFilter:
+    """
+    4 状态卡尔曼滤波器：[x, y, vx, vy]
+    
+    画面内羽毛球运动近似匀加速（重力），
+    但在几帧的短窗口内可以近似为匀速。
+    """
+    def __init__(self, dt: float = 1.0, process_noise: float = 1.0,
+                 measurement_noise: float = 3.0):
+        self.dt = dt
+        
+        # 状态转移：x_k = x_{k-1} + vx*dt
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ])
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ])
+        self.Q = np.eye(4) * process_noise
+        self.R = np.eye(2) * measurement_noise
+        
+        self.x = None  # [x, y, vx, vy]
+        self.P = np.eye(4) * 100.0
+        self.initialized = False
+
+    def init(self, x: float, y: float, vx: float = 0, vy: float = 0):
+        self.x = np.array([x, y, vx, vy], dtype=np.float64)
+        self.P = np.eye(4) * 100.0
+        self.initialized = True
+
+    def predict(self):
+        """仅预测（不更新），用于球丢失时。"""
+        if not self.initialized:
+            return None
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return float(self.x[0]), float(self.x[1])
+
+    def update(self, x: float, y: float):
+        """完整预测+更新。"""
+        if not self.initialized:
+            self.init(x, y)
+            return float(x), float(y)
+
+        # 预测
+        x_pred = self.F @ self.x
+        P_pred = self.F @ self.P @ self.F.T + self.Q
+
+        # 观测
+        z = np.array([x, y])
+        y_innov = z - self.H @ x_pred
+
+        # 更新
+        S = self.H @ P_pred @ self.H.T + self.R
+        K = P_pred @ self.H.T @ np.linalg.inv(S)
+        self.x = x_pred + K @ y_innov
+        self.P = (np.eye(4) - K @ self.H) @ P_pred
+
+        return float(self.x[0]), float(self.x[1])
+
+    def get_state(self):
+        if not self.initialized:
+            return None
+        return float(self.x[0]), float(self.x[1]), float(self.x[2]), float(self.x[3])
+
+    def reset(self):
+        self.x = None
+        self.P = np.eye(4) * 100.0
+        self.initialized = False
+
+
+# ============================================================
+# 抛物线预测器（画面外物理模型）
+# ============================================================
+
+class ParabolicPredictor:
+    """
+    抛物线轨迹预测。
+    
+    球飞出画面后，已知最后位置 (x0, y0) 和速度 (vx0, vy0)，
+    假设不受空气阻力（简化），轨迹为：
+      x(t) = x0 + vx0 * t
+      y(t) = y0 + vy0 * t + 0.5 * g * t²
+    
+    其中 g 是重力加速度（像素/帧²）。
+    """
+    
+    # 羽毛球重力加速度（粗略估计）
+    # 实际约 9.8 m/s²，转换为 px/frame² 取决于标定
+    # 默认值：假设 1m ≈ 100px, 30fps → 9.8*100/900 ≈ 1.1 px/f²
+    GRAVITY_PX_PER_FRAME2 = 1.1
+
+    def __init__(self, gravity: float = None):
+        self.g = gravity if gravity is not None else self.GRAVITY_PX_PER_FRAME2
+        self.x0 = 0.0
+        self.y0 = 0.0
+        self.vx0 = 0.0
+        self.vy0 = 0.0
+        self.t0 = 0
+
+    def set_initial(self, x: float, y: float, vx: float, vy: float, frame: int):
+        """设置预测起点。"""
+        self.x0 = x
+        self.y0 = y
+        self.vx0 = vx
+        self.vy0 = vy
+        self.t0 = frame
+
+    def predict(self, frame: int) -> Tuple[float, float]:
+        """预测指定帧的球位置。"""
+        t = frame - self.t0
+        x = self.x0 + self.vx0 * t
+        y = self.y0 + self.vy0 * t + 0.5 * self.g * t**2
+        return x, y
+
+    def predict_until(self, start_frame: int, end_frame: int) -> List[PredictedPoint]:
+        """预测从 start_frame 到 end_frame（不含）的所有帧位置。"""
+        points = []
+        for f in range(start_frame, end_frame):
+            x, y = self.predict(f)
+            dt = f - self.t0
+            # 置信度随时间衰减
+            conf = max(0.1, 1.0 - dt * 0.03)  # 每帧衰减 3%，最低 10%
+            points.append(PredictedPoint(
+                frame=f, x=float(x), y=float(y),
+                is_real=False, confidence=conf
+            ))
+        return points
+
+
+# ============================================================
+# 主预测器
+# ============================================================
+
+class TrajectoryPredictor:
+    """
+    轨迹预测器 — 完整状态机。
+    
+    用法:
+        predictor = TrajectoryPredictor(fps=30)
+        
+        for frame_id in range(total_frames):
+            ball_pos = detector.detect(frame)  # (x, y) 或 None
+            report = predictor.update(ball_pos, frame_id)
+            
+            if report.state == TrackState.TRACKING:
+                # 正常跟踪，report.current_position 是平滑后的位置
+                ...
+            elif report.state == TrackState.PREDICTING:
+                # 球丢失，使用 report.current_position 预测值
+                ...
+            elif report.state == TrackState.REACQUIRED:
+                # 球重新出现，report.gap_fills 包含丢失期间的预测帧
+                # 把这些帧也写入轨迹
+                for pt in report.gap_fills:
+                    trajectory.append(pt)
+            elif report.state == TrackState.EXPIRED:
+                # 球消失太久，轨迹结束
+                trajectory.append(TRAJECTORY_END_MARKER)
+                predictor.reset()
+    """
+
+    def __init__(self,
+                 fps: float = 30.0,
+                 max_lost_frames: int = 45,      # 1.5 秒 @ 30fps
+                 reacquire_match_radius: float = 80.0,  # 重捕获匹配半径（像素）
+                 kf_process_noise: float = 1.0,
+                 kf_measurement_noise: float = 3.0,
+                 gravity_px: float = None):
+        """
+        Args:
+            fps: 帧率
+            max_lost_frames: 球丢失后最多预测多少帧（超时则轨迹过期）
+            reacquire_match_radius: 球重入画面时的匹配半径
+            kf_process_noise: 卡尔曼过程噪声
+            kf_measurement_noise: 卡尔曼测量噪声
+            gravity_px: 重力加速度 (px/frame²)，None 则用默认值
+        """
+        self.fps = fps
+        self.max_lost = max_lost_frames
+        self.match_radius = reacquire_match_radius
+        
+        self.kf = BallKalmanFilter(dt=1.0, process_noise=kf_process_noise,
+                                   measurement_noise=kf_measurement_noise)
+        self.parabolic = ParabolicPredictor(gravity=gravity_px)
+        
+        self.state = TrackState.IDLE
+        self.lost_count = 0
+        self.last_frame = -1
+        self.lost_start_frame = -1
+        
+        # 统计
+        self.total_predictions = 0
+        self.successful_reacquisitions = 0
+
+    def update(self, ball_pos: Optional[Tuple[float, float]],
+               frame_id: int) -> TrackStateReport:
+        """
+        每帧调用。
+        
+        Args:
+            ball_pos: 检测到的球位置 (x, y)，None 表示没检测到
+            frame_id: 当前帧号
+        
+        Returns:
+            TrackStateReport: 当前状态和位置信息
+        """
+        
+        # ── 情况 1: 检测到了球 ──
+        if ball_pos is not None:
+            x_raw, y_raw = ball_pos
+            
+            # 1a. 之前是 PREDICTING → 尝试验证重捕获
+            if self.state == TrackState.PREDICTING:
+                pred_x, pred_y = self.parabolic.predict(frame_id)
+                dist = np.sqrt((x_raw - pred_x)**2 + (y_raw - pred_y)**2)
+                
+                if dist < self.match_radius:
+                    # 匹配成功！回填丢失帧
+                    gap_fills = self.parabolic.predict_until(
+                        self.lost_start_frame + 1, frame_id
+                    )
+                    self.successful_reacquisitions += 1
+                    
+                    # 恢复卡尔曼跟踪
+                    self.kf.init(x_raw, y_raw)
+                    self.state = TrackState.TRACKING
+                    self.lost_count = 0
+                    
+                    # 用卡尔曼平滑当前帧
+                    sx, sy = self.kf.update(x_raw, y_raw)
+                    vx, vy = self.kf.x[2], self.kf.x[3]
+                    
+                    return TrackStateReport(
+                        state=TrackState.REACQUIRED,
+                        current_position=(sx, sy),
+                        velocity=(float(vx), float(vy)),
+                        lost_duration=self.lost_count,
+                        confidence=0.85,  # 重捕获置信度略低于正常
+                        gap_fills=gap_fills,
+                    )
+                else:
+                    # 匹配失败 → 轨迹过期，可能是不同的球
+                    self.state = TrackState.EXPIRED
+                    self.kf.reset()
+                    self.lost_count = 0
+                    return TrackStateReport(
+                        state=TrackState.EXPIRED,
+                        current_position=None,
+                        velocity=None,
+                        lost_duration=self.lost_count,
+                        confidence=0.0,
+                    )
+            
+            # 1b. 之前是 TRACKING 或 IDLE → 正常跟踪
+            if self.state in (TrackState.TRACKING, TrackState.IDLE):
+                if not self.kf.initialized:
+                    self.kf.init(x_raw, y_raw)
+                
+                sx, sy = self.kf.update(x_raw, y_raw)
+                st = self.kf.get_state()
+                vx, vy = (st[2], st[3]) if st else (0.0, 0.0)
+                
+                self.state = TrackState.TRACKING
+                self.lost_count = 0
+                self.last_frame = frame_id
+                
+                return TrackStateReport(
+                    state=TrackState.TRACKING,
+                    current_position=(sx, sy),
+                    velocity=(float(vx), float(vy)),
+                    lost_duration=0,
+                    confidence=0.95,
+                )
+            
+            # 1c. 之前是 EXPIRED → 开始新的轨迹
+            if self.state == TrackState.EXPIRED:
+                self.kf.init(x_raw, y_raw)
+                self.state = TrackState.TRACKING
+                self.lost_count = 0
+                self.last_frame = frame_id
+                
+                return TrackStateReport(
+                    state=TrackState.TRACKING,
+                    current_position=(x_raw, y_raw),
+                    velocity=(0.0, 0.0),
+                    lost_duration=0,
+                    confidence=0.90,  # 新轨迹，置信度稍低
+                )
+        
+        # ── 情况 2: 没检测到球 ──
+        else:
+            self.lost_count += 1
+            
+            # 2a. 超时 → 过期
+            if self.lost_count > self.max_lost:
+                if self.state in (TrackState.TRACKING, TrackState.PREDICTING):
+                    self.state = TrackState.EXPIRED
+                    return TrackStateReport(
+                        state=TrackState.EXPIRED,
+                        current_position=None,
+                        velocity=None,
+                        lost_duration=self.lost_count,
+                        confidence=0.0,
+                    )
+            
+            # 2b. 刚丢失 → 从卡尔曼切换到抛物线预测
+            if self.state == TrackState.TRACKING and self.kf.initialized:
+                st = self.kf.get_state()
+                if st is not None:
+                    x0, y0, vx0, vy0 = st
+                    self.parabolic.set_initial(x0, y0, vx0, vy0, self.last_frame)
+                    self.lost_start_frame = self.last_frame
+                
+                self.state = TrackState.LOST
+            
+            # 2c. 已经是 LOST/PREDICTING → 继续预测
+            if self.state in (TrackState.LOST, TrackState.PREDICTING):
+                self.state = TrackState.PREDICTING
+                px, py = self.parabolic.predict(frame_id)
+                self.total_predictions += 1
+                
+                # 置信度衰减
+                dt = frame_id - self.lost_start_frame
+                conf = max(0.1, 0.90 - dt * 0.025)
+                
+                return TrackStateReport(
+                    state=TrackState.PREDICTING,
+                    current_position=(px, py),
+                    velocity=(self.parabolic.vx0, self.parabolic.vy0),
+                    lost_duration=self.lost_count,
+                    confidence=conf,
+                )
+            
+            # 2d. IDLE 状态 → 保持
+            if self.state == TrackState.IDLE:
+                return TrackStateReport(
+                    state=TrackState.IDLE,
+                    current_position=None,
+                    velocity=None,
+                    lost_duration=0,
+                    confidence=0.0,
+                )
+        
+        # 不应到达这里
+        return TrackStateReport(
+            state=self.state,
+            current_position=None,
+            velocity=None,
+            lost_duration=self.lost_count,
+            confidence=0.0,
+        )
+
+    def reset(self):
+        """重置状态机，准备下一次 rally。"""
+        self.kf.reset()
+        self.state = TrackState.IDLE
+        self.lost_count = 0
+        self.last_frame = -1
+        self.lost_start_frame = -1
+
+    @property
+    def is_tracking(self) -> bool:
+        """是否正在跟踪（包括预测中）。"""
+        return self.state in (TrackState.TRACKING, TrackState.LOST,
+                              TrackState.PREDICTING, TrackState.REACQUIRED)
+
+    @property
+    def is_predicting(self) -> bool:
+        """是否在预测模式（球已丢失）。"""
+        return self.state in (TrackState.LOST, TrackState.PREDICTING)
+
+
+# ============================================================
+# 测试
+# ============================================================
+
+if __name__ == '__main__':
+    print("轨迹预测器 v1.0 测试")
+    print("=" * 50)
+
+    predictor = TrajectoryPredictor(fps=30, max_lost_frames=30)
+
+    # 模拟一段轨迹：先跟踪 20 帧，然后球飞出画面 15 帧，再回来
+    print("\n[1] 正常跟踪 20 帧...")
+    for f in range(0, 20):
+        x = 500 + 5 * f
+        y = 300 - 8 * f + 0.3 * f**2
+        r = predictor.update((x, y), f)
+        if f % 10 == 0:
+            print(f"  frame {f}: state={r.state.name} pos=({r.current_position[0]:.0f},{r.current_position[1]:.0f})")
+
+    print(f"\n[2] 球飞出画面，预测 15 帧...")
+    for f in range(20, 35):
+        r = predictor.update(None, f)
+        if r.state == TrackState.PREDICTING and f % 5 == 0:
+            print(f"  frame {f}: state=PREDICTING pos=({r.current_position[0]:.0f},{r.current_position[1]:.0f}) conf={r.confidence:.2f}")
+
+    print(f"\n[3] 球重新入画...")
+    # 模拟球从预测位置附近出现（加一点噪声）
+    px, py = predictor.parabolic.predict(35)
+    r = predictor.update((px + 5, py - 3), 35)
+    print(f"  frame 35: state={r.state.name} gap_fills={len(r.gap_fills)} 帧")
+    if r.gap_fills:
+        print(f"  补帧范围: frame {r.gap_fills[0].frame} ~ {r.gap_fills[-1].frame}")
+        print(f"  补帧示例: frame {r.gap_fills[0].frame} → ({r.gap_fills[0].x:.0f},{r.gap_fills[0].y:.0f}) conf={r.gap_fills[0].confidence:.2f}")
+
+    print(f"\n[4] 超时测试...")
+    predictor.reset()
+    for f in range(0, 10):
+        r = predictor.update((500 + f*10, 300), f)
+    for f in range(10, 60):
+        r = predictor.update(None, f)
+    print(f"  丢失 50 帧后: state={r.state.name}  (max_lost=30)")
+
+    print(f"\n统计:")
+    print(f"  总预测帧: {predictor.total_predictions}")
+    print(f"  成功重捕获: {predictor.successful_reacquisitions}")
+    print("\n测试完成。")
