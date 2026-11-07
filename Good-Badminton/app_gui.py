@@ -59,6 +59,8 @@ class HawkEyeApp:
         self._preview_img = None
         self.var_mode = tk.StringVar(value="双打")
         self.var_frames = tk.StringVar(value="600")
+        self.var_detector = tk.StringVar(value="自动")
+        self.manual_corners = None
 
         root.title("羽毛球鹰眼分析台 · Badminton Hawk-Eye")
         root.geometry("1060x800")
@@ -114,6 +116,12 @@ class HawkEyeApp:
                  font=("Microsoft YaHei UI", 9)).pack(side="left")
         tk.Entry(opt, textvariable=self.var_frames, width=8, bg=C_CARD, fg=C_TEXT,
                  insertbackground=C_TEXT, relief="flat").pack(side="left", padx=(6, 18))
+        tk.Label(opt, text="检测器", bg=C_BG, fg=C_SUB,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        ttk.Combobox(opt, textvariable=self.var_detector, values=["自动", "运动检测", "YOLO"],
+                     width=8, state="readonly").pack(side="left", padx=(6, 18))
+        self.btn_corner = self._btn(opt, "手动标定球场", self.open_corner_picker, kind="ghost")
+        self.btn_corner.pack(side="left", padx=(0, 10))
         self.btn_play = self._btn(opt, "播放标注视频", self.open_video, kind="ghost")
         self.btn_play.pack(side="left")
 
@@ -249,7 +257,10 @@ class HawkEyeApp:
                 max_frames = int(self.var_frames.get() or 600)
             except ValueError:
                 max_frames = 600
+            det_map = {"自动": "auto", "运动检测": "motion", "YOLO": "yolo"}
             res = analyze_video(self.video_path, mode=mode, max_frames=max_frames,
+                                detector=det_map.get(self.var_detector.get(), "auto"),
+                                manual_corners=self.manual_corners,
                                 log=lambda m: self.q.put(("log", m)))
             if res.get("preview"):
                 self.q.put(("preview", res["preview"]))
@@ -285,6 +296,73 @@ class HawkEyeApp:
         except Exception:
             self.q.put(("log", "✗ 模拟失败：\n" + traceback.format_exc()))
             self.q.put(("done", {"ok": False}))
+
+    def open_corner_picker(self):
+        """弹出首帧，让用户依次点击球场四角（左上/右上/右下/左下）。"""
+        if not self.video_path:
+            messagebox.showinfo("提示", "先选一个视频。")
+            return
+        try:
+            import cv2
+        except Exception:
+            messagebox.showerror("错误", "缺少 opencv，无法标定。")
+            return
+        cap = cv2.VideoCapture(self.video_path)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(int(n * 0.1), 0))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            cap = cv2.VideoCapture(self.video_path)
+            ok, frame = cap.read()
+            cap.release()
+        if not ok or Image is None:
+            messagebox.showerror("错误", "读取首帧失败。")
+            return
+
+        h, w = frame.shape[:2]
+        scale = min(900.0 / w, 620.0 / h, 1.0)
+        disp = cv2.resize(frame, None, fx=scale, fy=scale)
+        win = tk.Toplevel(self.root)
+        win.title("点击球场四角：左上 → 右上 → 右下 → 左下")
+        win.configure(bg=C_BG)
+        cv = tk.Canvas(win, width=disp.shape[1], height=disp.shape[0], highlightthickness=0)
+        cv.pack()
+        img = Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+        photo = ImageTk.PhotoImage(img)
+        cv.create_image(0, 0, anchor="nw", image=photo)
+        cv.image = photo
+        tk.Label(win, text="依次点击球场四个角，点错可按 Backspace 撤销；点满四点自动保存",
+                 bg=C_BG, fg=C_SUB, font=("Microsoft YaHei UI", 9)).pack(fill="x", pady=6)
+        pts = []
+
+        def redraw():
+            cv.delete("mk")
+            for i, (x, y) in enumerate(pts):
+                cv.create_oval(x - 8, y - 8, x + 8, y + 8, outline=C_ACCENT, width=2, tags="mk")
+                cv.create_text(x + 14, y, text=str(i + 1), fill=C_ACCENT,
+                               font=("Microsoft YaHei UI", 11, "bold"), tags="mk")
+
+        def on_click(e):
+            if len(pts) >= 4:
+                return
+            pts.append((e.x, e.y))
+            redraw()
+            if len(pts) == 4:
+                self.manual_corners = [[x / scale, y / scale] for x, y in pts]
+                self._log(f"手动标定完成：{[f'({int(x)},{int(y)})' for x, y in self.manual_corners]}", "ok")
+                self._log("重新点「开始分析」即用手动四点做落点判罚。", "dim")
+                win.destroy()
+
+        def on_undo(_e):
+            if pts:
+                pts.pop()
+                redraw()
+
+        cv.bind("<Button-1>", on_click)
+        win.bind("<BackSpace>", on_undo)
+        win.transient(self.root)
+        win.grab_set()
 
     def open_out(self):
         target = self.out_dir or BASE

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -90,7 +92,8 @@ def _canonical_quad(pts: np.ndarray) -> np.ndarray:
 
 
 def detect_court(video_path: str, max_samples: int = 18,
-                 log: Callable[[str], None] = print) -> Tuple[Optional[np.ndarray], Dict]:
+                 log: Callable[[str], None] = print,
+                 max_frames: Optional[int] = None) -> Tuple[Optional[np.ndarray], Dict]:
     """多帧采样找最佳球场检测结果。返回 (corners, info)。"""
     info = {"attempted": 0, "success": False, "score": 0.0, "frame": -1}
     if auto_detect_court_corners is None:
@@ -105,7 +108,8 @@ def detect_court(video_path: str, max_samples: int = 18,
         cap.release()
         return None, info
 
-    idxs = np.linspace(0, max(total - 2, 0), num=min(max_samples, max(total, 1)), dtype=int)
+    limit = min(total, max_frames) if max_frames else total
+    idxs = np.linspace(0, max(limit - 2, 0), num=min(max_samples, max(limit, 1)), dtype=int)
     best, best_score = None, 0.0
     for i in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
@@ -170,12 +174,14 @@ class MotionDetector:
       · 内部降采样到 720p 处理，速度提升且不损失小球定位精度
     """
 
-    def __init__(self, proc_width: int = 1280, area_ratio=(0.000004, 0.0012),
-                 max_obj_px: int = 48, use_bg: bool = True):
+    def __init__(self, proc_width: int = 1280, area_ratio=(0.000004, 0.00045),
+                 max_obj_px: int = 26, use_bg: bool = True, max_per_frame: int = 24):
         self.proc_width = proc_width
         self.area_ratio = area_ratio
         self.max_obj_px = max_obj_px
         self.use_bg = use_bg
+        self.max_per_frame = max_per_frame
+        self.last_shift = (0.0, 0.0)
         self.bg = cv2.createBackgroundSubtractorMOG2(
             history=120, varThreshold=18, detectShadows=False) if use_bg else None
 
@@ -196,7 +202,20 @@ class MotionDetector:
         if self.use_bg and self.bg is not None:
             masks.append(self.bg.apply(gray_s))
         if prev_s is not None:
-            diff = cv2.absdiff(gray_s, prev_s)
+            prev_aligned = prev_s
+            # 镜头抖动补偿：相位相关估计全局位移，超过 1.2px 则对齐后再差分
+            try:
+                (dx, dy), _resp = cv2.phaseCorrelate(
+                    np.float32(prev_s), np.float32(gray_s))
+                if abs(dx) > 1.2 or abs(dy) > 1.2:
+                    Mshift = np.float32([[1, 0, -dx], [0, 1, -dy]])
+                    prev_aligned = cv2.warpAffine(prev_s, Mshift, (ws, hs),
+                                                  flags=cv2.INTER_LINEAR,
+                                                  borderMode=cv2.BORDER_REPLICATE)
+                    self.last_shift = (dx, dy)
+            except Exception:
+                pass
+            diff = cv2.absdiff(gray_s, prev_aligned)
             diff = cv2.GaussianBlur(diff, (3, 3), 0)
             sigma = float(np.median(diff)) + 3.0 * 1.4826 * float(np.median(np.abs(diff - np.median(diff))))
             thr = max(12.0, min(60.0, sigma * 1.6))
@@ -210,9 +229,10 @@ class MotionDetector:
         m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
 
         area_min = max(2.0, self.area_ratio[0] * hs * ws)
-        area_max = max(80.0, self.area_ratio[1] * hs * ws)
+        area_max = max(60.0, self.area_ratio[1] * hs * ws)
         cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        out = []
+        img_mean = float(gray_s.mean())
+        cands = []
         for c in cnts:
             a = cv2.contourArea(c)
             if not (area_min <= a <= area_max):
@@ -223,8 +243,64 @@ class MotionDetector:
             M = cv2.moments(c)
             if M["m00"] == 0:
                 continue
-            out.append((M["m10"] / M["m00"] / scale, M["m01"] / M["m00"] / scale, float(a)))
-        return out
+            cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+            # 羽毛球是高亮小白点：要求候选区域均值明显亮于全图（真场景的关键过滤）
+            patch = gray_s[max(int(cy) - 4, 0):int(cy) + 5, max(int(cx) - 4, 0):int(cx) + 5]
+            bright = float(patch.mean()) if patch.size else 0.0
+            if bright < img_mean * 1.12:
+                continue
+            cands.append((cx / scale, cy / scale, float(a), bright))
+        # 每帧候选上限，按亮度排序取最强的
+        cands.sort(key=lambda z: z[3], reverse=True)
+        return [(x, y, a) for x, y, a, _b in cands[:self.max_per_frame]]
+
+
+class YoloBallDetector:
+    """基于 yolo11s-ball.pt 的羽毛球检测器（真实比赛视频的主力方案）。
+
+    多人、多场地、镜头抖动的真场景里，帧差法会产生大量球员干扰点；
+    专用球检测模型能把这类误检压到很低。权重文件放在 weights/yolo11s-ball.pt。
+    """
+
+    DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "weights", "yolo11s-ball.pt")
+
+    def __init__(self, weights: Optional[str] = None, conf: float = 0.15,
+                 imgsz: int = 1280, device: str = "cpu", max_per_frame: int = 8):
+        from ultralytics import YOLO   # 延迟导入：没装 ultralytics 时不影响运动检测模式
+        w = weights or self.DEFAULT_WEIGHTS
+        if not os.path.exists(w):
+            raise FileNotFoundError(f"未找到球检测权重: {w}")
+        self.model = YOLO(w)
+        self.conf = conf
+        self.imgsz = imgsz
+        self.device = device
+        self.max_per_frame = max_per_frame
+        self.available = True
+
+    @classmethod
+    def is_available(cls, weights: Optional[str] = None) -> bool:
+        w = weights or cls.DEFAULT_WEIGHTS
+        if not os.path.exists(w):
+            return False
+        try:
+            import ultralytics  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def detect(self, frame, _gray=None):
+        r = self.model.predict(frame, imgsz=self.imgsz, conf=self.conf,
+                               device=self.device, verbose=False)[0]
+        out = []
+        if r.boxes is None:
+            return out
+        for b in r.boxes:
+            x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
+            c = float(b.conf[0]) if b.conf is not None and len(b.conf) else 0.0
+            out.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0, float((x2 - x1) * (y2 - y1)) * 0.01 + c))
+        out.sort(key=lambda z: z[2], reverse=True)
+        return out[:self.max_per_frame]
 
 
 def link_tracks(points_per_frame: List[List[Tuple[float, float, float]]],
@@ -268,13 +344,24 @@ def parabola_fit_score(track, min_len: int = 8) -> float:
         return 0.0
 
 
-def pick_main_track(tracks, min_len: int = 6, log: Optional[Callable] = None):
-    """挑主轨迹：抛物线拟合度 × 长度 × 平均速度 综合打分。"""
+def pick_main_track(tracks, min_len: int = 6, max_len: int = 120,
+                    min_disp: float = 30.0, min_r2: float = 0.35,
+                    log: Optional[Callable] = None):
+    """挑主轨迹：抛物线拟合度 × 长度 × 平均速度 综合打分。
+
+    真实场景下（多球员/观众/镜头抖动）会产生大量干扰轨迹，因此加三重硬门限：
+      · 长度上限：真实球在 30fps 下通常 8~90 帧可见，几千点的必是噪声
+      · 净位移下限：球必须在画面里真的移动过
+      · 抛物线拟合度下限：飞行轨迹必须近似抛物线
+    """
     if not tracks:
         return None, 0.0, 0.0
     scored = []
     for t in tracks:
-        if len(t) < min_len:
+        if not (min_len <= len(t) <= max_len):
+            continue
+        disp = float(np.hypot(t[-1][1] - t[0][1], t[-1][2] - t[0][2]))
+        if disp < min_disp:
             continue
         speed = 0.0
         for (f0, x0, y0), (f1, x1, y1) in zip(t, t[1:]):
@@ -282,16 +369,29 @@ def pick_main_track(tracks, min_len: int = 6, log: Optional[Callable] = None):
                 speed += np.hypot(x1 - x0, y1 - y0) / (f1 - f0)
         speed /= max(len(t) - 1, 1)
         r2 = parabola_fit_score(t)
-        # 拟合度权重最高：真实球轨迹近抛物线，干扰轨迹不满足
-        score = (0.35 + 0.65 * r2) * len(t) * (1.0 + min(speed, 200.0) / 80.0)
-        scored.append((score, r2, t))
+        score = (0.25 + 0.75 * r2) * len(t) * (1.0 + min(speed, 200.0) / 80.0)
+        scored.append((score, r2, t, disp))
     if not scored:
+        if log:
+            log(f"  [轨迹] {len(tracks)} 条候选均未通过门限（长度6~{max_len}、净位移≥{min_disp:.0f}px）")
         return None, 0.0, 0.0
+
     scored.sort(key=lambda z: z[0], reverse=True)
-    best = scored[0]
-    if log and len(scored) >= 3:
-        log(f"  [轨迹] 候选打分前3: " + ", ".join(
-            f"R²={s[1]:.2f}/长度{len(s[2])}" for s in scored[:3]))
+    if log and len(scored) >= 2:
+        log("  [轨迹] 候选前3: " + ", ".join(
+            f"R²={s[1]:.2f}/长度{len(s[2])}/位移{s[3]:.0f}px" for s in scored[:3]))
+    # 先过硬门槛（抛物线拟合度），再在合格轨迹里排序取最优
+    qualified = [s for s in scored if s[1] >= min_r2]
+    if not qualified:
+        if log:
+            log(f"  [轨迹] {len(scored)} 条候选抛物线拟合度均 < {min_r2}，判为不可信（多为球员跑动干扰）")
+        return None, 0.0, float(scored[0][1])
+    qualified.sort(key=lambda z: (0.25 + 0.75 * z[1]) * len(z[2]) * (1.0 + min(
+        float(np.hypot(z[2][-1][1] - z[2][0][1], z[2][-1][2] - z[2][0][2])) / max(len(z[2]), 1), 200.0) / 80.0),
+        reverse=True)
+    best = qualified[0]
+    if log:
+        log(f"  [轨迹] 合格轨迹 {len(qualified)} 条，选中 R²={best[1]:.2f}/长度{len(best[2])}")
     return best[2], float(best[0]), float(best[1])
 
 
@@ -316,11 +416,58 @@ def extrapolate_landing(court_pts: List[Tuple[float, float, float]],
 # ══════════════════════════════════════════════════════════════
 # 4-6. 主流程
 # ══════════════════════════════════════════════════════════════
+def _ffmpeg_path() -> Optional[str]:
+    for name in ("ffmpeg", "ffmpeg.exe"):
+        try:
+            r = subprocess.run([name, "-version"], capture_output=True, timeout=8)
+            if r.returncode == 0:
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def ensure_decodable(path: str, log: Callable[[str], None] = print,
+                     max_seconds: Optional[float] = None) -> str:
+    """确保 OpenCV 能解码。H.265/HEVC、部分手机录制的 mov 无法直接解码时，
+    用 ffmpeg 转 H.264 再读（真实素材最常见的坑）。"""
+    cap = cv2.VideoCapture(path)
+    ok = cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0
+    cap.release()
+    if ok:
+        return path
+
+    exe = _ffmpeg_path()
+    if exe is None:
+        log("  [解码] 该视频 OpenCV 无法解码（HEVC/特殊封装），且未找到 ffmpeg，无法转码")
+        return path
+
+    out = os.path.join(tempfile.mkdtemp(prefix="hawkeye_conv_"),
+                       Path(path).stem + "_h264.mp4")
+    cmd = [exe, "-y", "-v", "error", "-i", path]
+    if max_seconds:
+        cmd += ["-t", str(int(max_seconds))]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-an", out]
+    log("  [解码] 检测到 HEVC/特殊编码，正在用 ffmpeg 转码为 H.264 …")
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=1800)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
+            log(f"  [解码] 转码完成: {out}")
+            return out
+        log(f"  [解码] 转码失败: {r.stderr.decode('utf-8', 'ignore')[:160]}")
+    except Exception as e:
+        log(f"  [解码] 转码异常: {e}")
+    return path
+
+
 def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   mode: str = "doubles",
                   log: Callable[[str], None] = print,
                   make_video: bool = True,
-                  max_frames: Optional[int] = None) -> Dict:
+                  max_frames: Optional[int] = None,
+                  manual_corners: Optional[List[List[float]]] = None,
+                  detector: str = "auto") -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -331,10 +478,14 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                     "stages": {}, "out_dir": out_dir}
 
     log(f"▶ 分析: {Path(video_path).name}")
+    # ---- 解码兜底（HEVC / 手机录制） ----
+    vp = ensure_decodable(video_path, log=log)
+    if vp != video_path:
+        result["transcoded"] = vp
     # ---- 元信息 ----
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(vp)
     if not cap.isOpened():
-        log("✗ 无法打开视频")
+        log("✗ 无法打开视频（解码失败）")
         result["error"] = "cannot_open"
         return result
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -346,8 +497,16 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         + (f"（只处理前 {max_frames} 帧）" if max_frames else ""))
     result.update(fps=round(fps, 2), frames=n_total, size=[w, h])
 
-    # ---- 1. 球场 ----
-    corners, court_info = detect_court(video_path, log=log)
+    # ---- 1. 球场（手动四点优先，其次自动检测）----
+    if manual_corners and len(manual_corners) == 4:
+        corners = _canonical_quad(np.array(manual_corners, dtype=np.float32))
+        court_info = {"attempted": 0, "success": True, "score": 1.0,
+                      "frame": 0, "source": "manual"}
+        log("  [球场] 使用手动标定的四点")
+    else:
+        corners, court_info = detect_court(vp, log=log, max_frames=max_frames)
+        if corners is not None:
+            court_info["source"] = "auto"
     H, (CW, CL) = (None, (CC.COURT_WIDTH, CC.COURT_LENGTH))
     if corners is not None:
         H, (CW, CL) = build_homography(corners, mode)
@@ -357,11 +516,25 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         result["stages"]["court"] = {"ok": False, **court_info}
 
     # ---- 2. 逐帧运动检测（背景建模 + 帧差，带进度） ----
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(vp)
     prev_gray = None
     per_frame: List[List[Tuple[float, float, float]]] = []
     keep_frames: List[np.ndarray] = []
-    detector = MotionDetector()
+    use_yolo = False
+    if detector in ("auto", "yolo") and YoloBallDetector.is_available():
+        try:
+            det = YoloBallDetector()
+            use_yolo = True
+            log(f"  [检测] 使用 YOLO 球检测模型（imgsz={det.imgsz}, conf={det.conf}）")
+        except Exception as e:
+            log(f"  [检测] YOLO 初始化失败（{e}），回退运动检测")
+            det = MotionDetector()
+    else:
+        det = MotionDetector()
+        if detector == "yolo":
+            log("  [检测] 未找到 weights/yolo11s-ball.pt 或未安装 ultralytics，回退运动检测")
+        else:
+            log("  [检测] 使用运动检测（背景建模+帧差）")
     fi = 0
     next_report = 0.1
     while True:
@@ -371,7 +544,7 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         if max_frames and fi >= max_frames:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        per_frame.append(detector.detect(prev_gray, gray))
+        per_frame.append(det.detect(frame, gray) if use_yolo else det.detect(prev_gray, gray))
         prev_gray = gray
         keep_frames.append(frame)
         fi += 1
@@ -383,12 +556,27 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     cap.release()
     n = len(per_frame)
     n_cand = sum(len(p) for p in per_frame)
-    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（背景建模+帧差双路）")
-    result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand}
+    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（{'YOLO 球检测' if use_yolo else '背景建模+帧差双路'}）")
+    result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand, "detector": "yolo" if use_yolo else "motion"}
 
     # ---- 3. 轨迹串联 + 抛物线拟合筛选 ----
     tracks = link_tracks(per_frame)
     main_track, score, r2 = pick_main_track(tracks, log=log)
+
+    # 结果驱动回退：YOLO 模式下轨迹不成形（如合成/非常规画面），补跑运动检测重试一次
+    if (main_track is None or len(main_track) < 4) and use_yolo and detector == "auto":
+        log("  [检测] YOLO 未形成有效轨迹，自动补跑运动检测后重试")
+        det_m = MotionDetector()
+        prev_gray = None
+        for i, frame in enumerate(keep_frames):
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            per_frame[i] = per_frame[i] + det_m.detect(prev_gray, gray)
+            prev_gray = gray
+        use_yolo = False
+        tracks = link_tracks(per_frame)
+        main_track, score, r2 = pick_main_track(tracks, log=log)
+        result["stages"]["detect"]["fallback"] = "motion"
+
     if main_track is None or len(main_track) < 4:
         log("  [轨迹] 未形成有效轨迹（可能是镜头移动或球速过快）")
         result["stages"]["track"] = {"ok": False, "tracks": len(tracks)}
@@ -414,6 +602,13 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         ext = extrapolate_landing(court_pts, frames_ahead=min(8, max(4, len(main_track) // 8)))
         # 主判罚用「最后观测点」：真实视频中球在落地瞬间失联，末点即落点
         use = (obs[1], obs[2])
+        if not (-0.3 * CW <= use[0] <= 1.3 * CW and -0.3 * CL <= use[1] <= 1.3 * CL):
+            # 单应变换只对地平面(z=0)成立：球若仍在空中，映射必然离谱。
+            log(f"  [落点] 映射结果 ({use[0]:.1f}, {use[1]:.1f}) m 远超场地范围 —— "
+                "本段轨迹未跟到落地（球仍在空中），不给出落点判罚")
+            result["stages"]["landing"] = {"ok": False, "reason": "still_in_flight",
+                                           "raw_court_xy": [round(use[0], 3), round(use[1], 3)]}
+            landing = None
         j = judge.judge(use[0], use[1])
         landing = {"frame": last_f,
                    "court_xy": [round(use[0], 3), round(use[1], 3)],
@@ -610,6 +805,10 @@ if __name__ == "__main__":
     ap.add_argument("--demo", action="store_true", help="生成合成演示视频并分析")
     ap.add_argument("--mode", default="doubles", choices=["doubles", "singles"])
     ap.add_argument("--max-frames", type=int, default=600)
+    ap.add_argument("--detector", default="auto", choices=["auto", "motion", "yolo"],
+                    help="检测器：auto=有YOLO权重就用YOLO")
+    ap.add_argument("--corners", type=str, default=None,
+                    help='手动球场四角，格式 "x1,y1;x2,y2;x3,y3;x4,y4"（左上/右上/右下/左下）')
     args = ap.parse_args()
 
     vp = args.video
@@ -618,4 +817,10 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(vp), exist_ok=True)
         make_demo_video(vp)
         print(f"[演示] 已生成合成视频: {vp}")
-    analyze_video(vp, mode=args.mode, max_frames=args.max_frames)
+    mc = None
+    if args.corners:
+        mc = [[float(v) for v in pair.split(",")]
+              for pair in args.corners.replace(" ", "").split(";") if pair]
+        print(f"[手动标定] 四点: {mc}")
+    analyze_video(vp, mode=args.mode, max_frames=args.max_frames,
+                  manual_corners=mc, detector=args.detector)
