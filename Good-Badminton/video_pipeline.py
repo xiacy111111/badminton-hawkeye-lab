@@ -159,31 +159,72 @@ def img_to_court(H: np.ndarray, pt) -> Tuple[float, float]:
 # ══════════════════════════════════════════════════════════════
 # 2-3. 运动法小目标检测 + 轨迹串联
 # ══════════════════════════════════════════════════════════════
-def detect_motion_candidates(prev_gray, gray, area_min=3, area_max=None, thresh=18):
-    """帧差 + 阈值 + 形态学 → 候选点列表 [(cx, cy, area)]。"""
-    if prev_gray is None:
-        return []
-    h, w = gray.shape[:2]
-    if area_max is None:
-        area_max = max(120, int(h * w * 0.0015))
-    diff = cv2.absdiff(gray, prev_gray)
-    diff = cv2.GaussianBlur(diff, (3, 3), 0)
-    _, m = cv2.threshold(diff, thresh, 255, cv2.THRESH_BINARY)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
-    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = []
-    for c in cnts:
-        a = cv2.contourArea(c)
-        if area_min <= a <= area_max:
-            x, y, bw, bh = cv2.boundingRect(c)
-            if bw > 60 or bh > 60:          # 大目标（人/球员）排除
+class MotionDetector:
+    """羽毛球候选点检测：背景建模 + 帧差 双路并集（鲁棒版）
+
+    改进点（相对原始帧差法）：
+      · MOG2 背景建模：抗静态场景的光照渐变、缓慢变化
+      · 帧差：补背景模型初始化期的漏检、抗运动球漏检
+      · 自适应阈值：按图像噪声水平动态设门限（暗光/高噪场景不失效）
+      · 尺寸门限按画面比例自动计算，排除球员/球拍等大目标
+      · 内部降采样到 720p 处理，速度提升且不损失小球定位精度
+    """
+
+    def __init__(self, proc_width: int = 1280, area_ratio=(0.000004, 0.0012),
+                 max_obj_px: int = 48, use_bg: bool = True):
+        self.proc_width = proc_width
+        self.area_ratio = area_ratio
+        self.max_obj_px = max_obj_px
+        self.use_bg = use_bg
+        self.bg = cv2.createBackgroundSubtractorMOG2(
+            history=120, varThreshold=18, detectShadows=False) if use_bg else None
+
+    def detect(self, prev_gray, gray):
+        """返回 [(cx, cy, area)]，坐标为输入图坐标系。"""
+        h, w = gray.shape[:2]
+        scale = 1.0
+        if w > self.proc_width:
+            scale = self.proc_width / float(w)
+            gray_s = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            prev_s = (cv2.resize(prev_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                      if prev_gray is not None else None)
+        else:
+            gray_s, prev_s = gray, prev_gray
+        hs, ws = gray_s.shape[:2]
+
+        masks = []
+        if self.use_bg and self.bg is not None:
+            masks.append(self.bg.apply(gray_s))
+        if prev_s is not None:
+            diff = cv2.absdiff(gray_s, prev_s)
+            diff = cv2.GaussianBlur(diff, (3, 3), 0)
+            sigma = float(np.median(diff)) + 3.0 * 1.4826 * float(np.median(np.abs(diff - np.median(diff))))
+            thr = max(12.0, min(60.0, sigma * 1.6))
+            _, m = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
+            masks.append(m)
+        if not masks:
+            return []
+        m = masks[0] if len(masks) == 1 else cv2.bitwise_or(masks[0], masks[1])
+
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
+
+        area_min = max(2.0, self.area_ratio[0] * hs * ws)
+        area_max = max(80.0, self.area_ratio[1] * hs * ws)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if not (area_min <= a <= area_max):
                 continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            if bw > self.max_obj_px * ws / 1280.0 or bh > self.max_obj_px * hs / 720.0:
+                continue                      # 球员/球拍等大目标
             M = cv2.moments(c)
             if M["m00"] == 0:
                 continue
-            out.append((M["m10"] / M["m00"], M["m01"] / M["m00"], float(a)))
-    return out
+            out.append((M["m10"] / M["m00"] / scale, M["m01"] / M["m00"] / scale, float(a)))
+        return out
 
 
 def link_tracks(points_per_frame: List[List[Tuple[float, float, float]]],
@@ -208,25 +249,68 @@ def link_tracks(points_per_frame: List[List[Tuple[float, float, float]]],
     return [t["pts"] for t in tracks]
 
 
-def pick_main_track(tracks, min_len=6):
-    """挑主轨迹：长度优先 + 平均速度加权。"""
+def parabola_fit_score(track, min_len: int = 8) -> float:
+    """轨迹的抛物线拟合度 R²（0~1）。羽毛球飞行近似抛物线，
+    球员跑动/球拍挥动等干扰轨迹拟合度低，用此打分可有效剔除。"""
+    if len(track) < min_len:
+        return 0.0
+    xs = np.array([p[1] for p in track], float)
+    ys = np.array([p[2] for p in track], float)
+    if np.ptp(xs) < 12 or np.ptp(ys) < 6:
+        return 0.0
+    try:
+        coef = np.polyfit(xs, ys, 2)
+        pred = np.polyval(coef, xs)
+        ss_res = float(np.sum((ys - pred) ** 2))
+        ss_tot = float(np.sum((ys - ys.mean()) ** 2))
+        return max(0.0, 1.0 - ss_res / max(ss_tot, 1e-9))
+    except Exception:
+        return 0.0
+
+
+def pick_main_track(tracks, min_len: int = 6, log: Optional[Callable] = None):
+    """挑主轨迹：抛物线拟合度 × 长度 × 平均速度 综合打分。"""
     if not tracks:
-        return None, 0.0
+        return None, 0.0, 0.0
     scored = []
     for t in tracks:
         if len(t) < min_len:
             continue
-        span = max(t[-1][0] - t[0][0], 1)
         speed = 0.0
         for (f0, x0, y0), (f1, x1, y1) in zip(t, t[1:]):
             if f1 != f0:
                 speed += np.hypot(x1 - x0, y1 - y0) / (f1 - f0)
         speed /= max(len(t) - 1, 1)
-        scored.append((len(t) * (1 + speed / 50.0), t))
+        r2 = parabola_fit_score(t)
+        # 拟合度权重最高：真实球轨迹近抛物线，干扰轨迹不满足
+        score = (0.35 + 0.65 * r2) * len(t) * (1.0 + min(speed, 200.0) / 80.0)
+        scored.append((score, r2, t))
     if not scored:
-        return None, 0.0
+        return None, 0.0, 0.0
     scored.sort(key=lambda z: z[0], reverse=True)
-    return scored[0][1], float(scored[0][0])
+    best = scored[0]
+    if log and len(scored) >= 3:
+        log(f"  [轨迹] 候选打分前3: " + ", ".join(
+            f"R²={s[1]:.2f}/长度{len(s[2])}" for s in scored[:3]))
+    return best[2], float(best[0]), float(best[1])
+
+
+def extrapolate_landing(court_pts: List[Tuple[float, float, float]],
+                        frames_ahead: int = 14) -> Optional[Tuple[float, float]]:
+    """在球场坐标系中二次拟合 x(t) 与 y(t)，向前外推得到估算落点。"""
+    if len(court_pts) < 6:
+        return None
+    tail = court_pts[-max(8, int(len(court_pts) * 0.6)):]
+    t = np.array([p[0] for p in tail], float)
+    xx = np.array([p[1] for p in tail], float)
+    yy = np.array([p[2] for p in tail], float)
+    try:
+        cx = np.polyfit(t, xx, 2)
+        cy = np.polyfit(t, yy, 2)
+    except Exception:
+        return None
+    t_end = float(t[-1]) + frames_ahead
+    return float(np.polyval(cx, t_end)), float(np.polyval(cy, t_end))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,12 +356,14 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     else:
         result["stages"]["court"] = {"ok": False, **court_info}
 
-    # ---- 2. 逐帧运动检测 ----
+    # ---- 2. 逐帧运动检测（背景建模 + 帧差，带进度） ----
     cap = cv2.VideoCapture(video_path)
     prev_gray = None
     per_frame: List[List[Tuple[float, float, float]]] = []
     keep_frames: List[np.ndarray] = []
+    detector = MotionDetector()
     fi = 0
+    next_report = 0.1
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -285,45 +371,64 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         if max_frames and fi >= max_frames:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        per_frame.append(detect_motion_candidates(prev_gray, gray))
+        per_frame.append(detector.detect(prev_gray, gray))
         prev_gray = gray
         keep_frames.append(frame)
         fi += 1
+        if n_total and n_total > 60:
+            prog = fi / float(min(n_total, max_frames or n_total))
+            if prog >= next_report:
+                log(f"  [检测] 进度 {prog*100:.0f}%  ({fi} 帧)")
+                next_report += 0.25
     cap.release()
     n = len(per_frame)
     n_cand = sum(len(p) for p in per_frame)
-    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个")
+    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（背景建模+帧差双路）")
     result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand}
 
-    # ---- 3. 轨迹串联 ----
+    # ---- 3. 轨迹串联 + 抛物线拟合筛选 ----
     tracks = link_tracks(per_frame)
-    main_track, score = pick_main_track(tracks)
+    main_track, score, r2 = pick_main_track(tracks, log=log)
     if main_track is None or len(main_track) < 4:
         log("  [轨迹] 未形成有效轨迹（可能是镜头移动或球速过快）")
         result["stages"]["track"] = {"ok": False, "tracks": len(tracks)}
         result["error"] = "no_track"
         return _finish(result, out_dir, None, log, t0)
 
-    log(f"  [轨迹] 候选轨迹 {len(tracks)} 条，主轨迹 {len(main_track)} 点")
+    log(f"  [轨迹] 候选轨迹 {len(tracks)} 条，主轨迹 {len(main_track)} 点（抛物线 R²={r2:.2f}）")
     result["stages"]["track"] = {"ok": True, "tracks": len(tracks),
-                                 "main_len": len(main_track), "score": round(score, 1)}
+                                 "main_len": len(main_track),
+                                 "score": round(score, 1), "parabola_r2": round(r2, 3)}
 
-    # ---- 4. 落点 ----
+    # ---- 4. 落点：观测值 + 外推值双重估计 ----
     landing = None
     last_f, lx, ly = main_track[-1]
     if H is not None:
-        cx, cy = img_to_court(H, (lx, ly))
-        if 0 <= cx <= CW * 1.5 and 0 <= cy <= CL * 1.5:
-            judge = CourtJudge(mode=mode)
-            j = judge.judge(cx, cy)
-            landing = {"frame": last_f, "image_xy": [round(lx, 1), round(ly, 1)],
-                       "court_xy": [round(cx, 3), round(cy, 3)], "judge": j,
-                       "estimated": True}
-            log(f"  [落点] 球场坐标 ({cx:.2f}, {cy:.2f}) m → {j['result']}"
-                f"（压线裕度 {j['margin_mm']} mm，估算值）")
-        else:
-            log("  [落点] 落点超出球场范围，可能是误检轨迹")
-            result["stages"]["landing"] = {"ok": False, "reason": "out_of_court"}
+        judge = CourtJudge(mode=mode)
+        court_pts = []
+        for f, x, y in main_track:
+            cx_, cy_ = img_to_court(H, (x, y))
+            court_pts.append((float(f), cx_, cy_))
+
+        obs = court_pts[-1]
+        ext = extrapolate_landing(court_pts, frames_ahead=min(8, max(4, len(main_track) // 8)))
+        # 主判罚用「最后观测点」：真实视频中球在落地瞬间失联，末点即落点
+        use = (obs[1], obs[2])
+        j = judge.judge(use[0], use[1])
+        landing = {"frame": last_f,
+                   "court_xy": [round(use[0], 3), round(use[1], 3)],
+                   "judge": j,
+                   "method": "last_observed",
+                   "image_xy": [round(lx, 1), round(ly, 1)],
+                   "estimated": True}
+        # 外推值仅作参考（轨迹明显未走完时更接近真实落点）
+        if ext is not None and -0.3 * CW <= ext[0] <= 1.3 * CW and -0.3 * CL <= ext[1] <= 1.3 * CL:
+            ej = judge.judge(ext[0], ext[1])
+            landing["extrapolated_court_xy"] = [round(ext[0], 3), round(ext[1], 3)]
+            landing["extrapolated_judge"] = ej["result"]
+            log(f"  [落点] 参考外推: ({ext[0]:.2f}, {ext[1]:.2f}) m → {ej['result']}（仅供参考）")
+        log(f"  [落点] 球场坐标 ({use[0]:.2f}, {use[1]:.2f}) m → {j['result']}"
+            f"（压线裕度 {j['margin_mm']} mm，末观测点估算）")
     else:
         log("  [落点] 无球场标定，跳过落点判罚（仅输出轨迹）")
         result["stages"]["landing"] = {"ok": False, "reason": "no_court_calib"}

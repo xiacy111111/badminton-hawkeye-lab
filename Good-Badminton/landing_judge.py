@@ -115,7 +115,8 @@ class CourtJudge:
         inside_mm = margin * 1000.0
         if inside:
             result = "界内"
-            if inside_mm < COURT_LINE_WIDTH * 1000 * 0.5:
+            # 落点距线外沿不足一个线宽（40mm）→ 视为压线
+            if inside_mm < COURT_LINE_WIDTH * 1000:
                 result = "压线(界内)"
         else:
             result = "界外"

@@ -53,9 +53,12 @@ class HawkEyeApp:
         self.root = root
         self.video_path = None
         self.out_dir = None
+        self.annotated = None
         self.q = queue.Queue()
         self.busy = False
         self._preview_img = None
+        self.var_mode = tk.StringVar(value="双打")
+        self.var_frames = tk.StringVar(value="600")
 
         root.title("羽毛球鹰眼分析台 · Badminton Hawk-Eye")
         root.geometry("1060x800")
@@ -98,6 +101,21 @@ class HawkEyeApp:
         self.status = tk.Label(bar, text="就绪", bg=C_BG, fg=C_SUB,
                                font=("Microsoft YaHei UI", 10))
         self.status.pack(side="right")
+
+        # 选项行
+        opt = tk.Frame(self.root, bg=C_BG)
+        opt.pack(fill="x", padx=22, pady=(8, 0))
+        tk.Label(opt, text="判罚模式", bg=C_BG, fg=C_SUB,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        cb = ttk.Combobox(opt, textvariable=self.var_mode, values=["双打", "单打"],
+                          width=6, state="readonly")
+        cb.pack(side="left", padx=(6, 18))
+        tk.Label(opt, text="最多处理帧数", bg=C_BG, fg=C_SUB,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Entry(opt, textvariable=self.var_frames, width=8, bg=C_CARD, fg=C_TEXT,
+                 insertbackground=C_TEXT, relief="flat").pack(side="left", padx=(6, 18))
+        self.btn_play = self._btn(opt, "播放标注视频", self.open_video, kind="ghost")
+        self.btn_play.pack(side="left")
 
         # 主体：左日志 右预览
         body = tk.Frame(self.root, bg=C_BG)
@@ -226,10 +244,17 @@ class HawkEyeApp:
     def _worker_analyze(self):
         try:
             from video_pipeline import analyze_video
-            res = analyze_video(self.video_path, log=lambda m: self.q.put(("log", m)))
+            mode = "singles" if self.var_mode.get() == "单打" else "doubles"
+            try:
+                max_frames = int(self.var_frames.get() or 600)
+            except ValueError:
+                max_frames = 600
+            res = analyze_video(self.video_path, mode=mode, max_frames=max_frames,
+                                log=lambda m: self.q.put(("log", m)))
             if res.get("preview"):
                 self.q.put(("preview", res["preview"]))
             self.out_dir = res.get("out_dir")
+            self.annotated = res.get("annotated_video")
             self.q.put(("done", res))
         except Exception:
             self.q.put(("log", "✗ 分析异常：\n" + traceback.format_exc()))
@@ -268,6 +293,15 @@ class HawkEyeApp:
         except Exception:
             subprocess.Popen(["explorer", target])
 
+    def open_video(self):
+        if self.annotated and os.path.exists(self.annotated):
+            try:
+                os.startfile(self.annotated)
+                return
+            except Exception:
+                pass
+        messagebox.showinfo("提示", "还没有标注视频，先跑一次「开始分析」。")
+
     def _toggle_buttons(self, enabled):
         state = "normal" if enabled else "disabled"
         for b in (self.btn_choose, self.btn_run, self.btn_sim):
@@ -282,6 +316,12 @@ class HawkEyeApp:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self._log(payload)
+                    if "进度" in payload and not payload.strip().startswith("  [检测] 处理"):
+                        try:
+                            pct = payload.split("进度")[1].split("%")[0].strip()
+                            self.status.config(text=f"分析中… {pct}%", fg=C_WARN)
+                        except Exception:
+                            pass
                 elif kind == "preview":
                     self._show_preview(payload)
                 elif kind == "done":
