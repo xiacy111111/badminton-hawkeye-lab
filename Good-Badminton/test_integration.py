@@ -272,7 +272,7 @@ def run_full_simulation():
     print("=" * 65)
 
     # ── 1. 双目 + 噪声模型 ────────────────────────
-    stereo = VirtualStereoCamera()
+    stereo = VirtualStereoCamera(baseline=13.4)   # 修复：改用全场大基线（原为 0.5m 小基线）
     noise_model = DynamicNoiseModel()
     print(f"\n[1/5] 虚拟双目 + 动态噪声模型")
     print(f"  双目: {stereo.w}×{stereo.h}, f={stereo.f}px, 基线={stereo.baseline}m")
@@ -389,37 +389,54 @@ def run_full_simulation():
     # ── 4. 落地检测 + 判罚 ───────────────────────
     print(f"\n[4/5] 落地检测")
     try:
-        from physics_landing_detector import LandingDetector
+        from physics_landing_detector import LandingDetector  # noqa: F401
         ld = LandingDetector()
         print("  使用: physics_landing_detector.py")
     except ImportError:
-        ld = SimpleLandingDetector(height_threshold=0.02)
-        print("  使用: SimpleLandingDetector (threshold=0.02m)")
+        from landing_judge import LandingDetector as RobustLandingDetector
+        ld = RobustLandingDetector()
+        print("  使用: landing_judge.LandingDetector (自适应阈值 + 趋势反转 + 兜底投影)")
 
     try:
         from judgment_engine import LineCallEngine
-        judge = JudgmentEngine()
+        judge = LineCallEngine()          # 修复：原代码误写 JudgmentEngine（未定义）
         print("  使用: judgment_engine.py")
     except ImportError:
-        judge = None
-        print("  判罚: 简易边界检查")
+        from landing_judge import CourtJudge
+        judge = CourtJudge()
+        print("  判罚: CourtJudge（单打/双打边线 + 压线裕度）")
 
     judgments = []
     for traj_name, results in all_results:
         ld.reset()
+        last_pt = None
         for r in results:
             if r["recon_3d"] is not None:
+                last_pt = r["recon_3d"]
                 landing = ld.update(r["recon_3d"], r["t"])
                 if landing is not None:
                     pos = landing["position"]
                     if judge:
-                        j = judge.judge(pos)
+                        j = judge.judge_landing(pos[0], pos[1])
                     else:
                         in_b = (0 <= pos[0] <= court_config.COURT_WIDTH and
                                 0 <= pos[1] <= court_config.COURT_LENGTH)
                         j = "界内" if in_b else "界外"
                     judgments.append((traj_name, pos, j))
                     print(f"  {traj_name}: ({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.4f}) → {j}")
+        # 兜底：该轨迹未触发落地检测时，用最后一点投影估算落点
+        if not getattr(ld, "detected", False) and last_pt is not None:
+            landing = ld.finalize(last_pt)
+            if landing is not None:
+                pos = landing["position"]
+                if judge:
+                    j = judge.judge_landing(pos[0], pos[1])
+                else:
+                    in_b = (0 <= pos[0] <= court_config.COURT_WIDTH and
+                            0 <= pos[1] <= court_config.COURT_LENGTH)
+                    j = "界内" if in_b else "界外"
+                judgments.append((traj_name, pos, j))
+                print(f"  {traj_name}(推算): ({pos[0]:.2f},{pos[1]:.2f}) → {j}")
 
     # ── 5. 汇总 ──────────────────────────────────
     print(f"\n[5/5] 测试汇总")

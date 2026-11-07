@@ -41,6 +41,14 @@ try:
 except ImportError:
     JudgeEngine = None
 
+# ─── 修复模块：鲁棒落地检测 + 场地判罚（替代阈值过严的旧实现）───
+from landing_judge import LandingDetector as RobustLandingDetector, CourtJudge
+
+if LandingDetector is None:
+    LandingDetector = RobustLandingDetector
+if JudgeEngine is None:
+    JudgeEngine = CourtJudge
+
 try:
     from court_3d import Court3D
 except ImportError:
@@ -320,6 +328,21 @@ class HawkEyeSystem:
                 print(f"  3D误差: 均值{np.mean(errors_this)*1000:.1f}mm "
                       f"中位{np.median(errors_this)*1000:.1f}mm "
                       f"最大{np.max(errors_this)*1000:.1f}mm")
+
+            # ── 兜底：整条轨迹未触发落地检测时，用最后一点投影到地面推算落点 ──
+            if self.landing_det is not None and traj_3d_points:
+                already = getattr(self.landing_det, "detected", False)
+                if not already:
+                    landing = self.landing_det.finalize(traj_3d_points[-1])
+                    if landing is not None:
+                        pos = landing["position"]
+                        if self.judge is not None:
+                            j = self.judge.judge_landing(pos[0], pos[1])
+                        else:
+                            j = "界内" if 0 <= pos[0] <= court_config.COURT_WIDTH and \
+                                0 <= pos[1] <= court_config.COURT_LENGTH else "界外"
+                        judgments.append((traj_name, pos, j))
+                        print(f"  落地(推算): ({pos[0]:.2f},{pos[1]:.2f}) → {j}")
                 all_errors.extend(errors_this)
 
             if self.court_3d and traj_3d_points:
