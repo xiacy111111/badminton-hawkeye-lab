@@ -1,0 +1,10 @@
+{
+  "frames": 37,
+  "auto_labeled": 35,
+  "negatives": 2,
+  "skipped": 11,
+  "per_video": {
+    "demo1.mp4": 25,
+    "test_1min.mp4": 23
+  }
+}

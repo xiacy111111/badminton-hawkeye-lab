@@ -1,0 +1,5 @@
+path: C:/Users/13650/Desktop/badminton-hawkeye-github/Good-Badminton/finetune/dataset_smoke
+train: images/train
+val: images/val
+names:
+  0: ball

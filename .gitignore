@@ -20,3 +20,10 @@ req_temp.txt
 # 系统
 .DS_Store
 Thumbs.db
+
+# 训练产物与数据集
+runs/
+finetune/dataset/
+finetune/dataset_*/
+finetune/*.pt
+finetune/eval_report.json

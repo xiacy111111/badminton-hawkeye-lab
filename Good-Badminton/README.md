@@ -478,6 +478,39 @@ python video_pipeline.py 视频.mp4 --detector motion    # 无权重时的纯 Op
 - 多场地同框 + 手持抖动场景，自动标定不可靠，需手动四点；
 - CPU 上 YOLO 约 2 秒/帧，长视频建议分段或用 GPU。
 
+
+### 七、微调：用西电羽球队数据做领域自适应
+
+预训练权重来自转播素材，直接用在自家球馆会明显掉点。`finetune/` 提供了完整闭环：
+
+```
+原始视频 → 抽帧(去重/去模糊) → YOLO 预标注 → 人工修正 → 划分 train/val
+        → 微调(yolo11s-ball 起点) → 评估(与基线对比) → badcase 回灌迭代
+```
+
+```bash
+# 1) 构建数据集（自动抽帧 + 预标注）
+python finetune/prepare_dataset.py --videos "D:/xtu_raw" --out finetune/dataset \
+       --frames-per-video 150 --conf 0.20
+
+# 2) 人工修正 labels/（LabelImg / Label Studio；保留负样本以压制误检）
+
+# 3) 微调（小数据集建议 --freeze 10）
+python finetune/train.py --data finetune/dataset/data.yaml \
+       --epochs 100 --imgsz 1280 --batch 8 --device auto --freeze 10 --lr0 0.001
+
+# 4) 评估 + 与基线对比（这张表就是材料里的核心数据）
+python finetune/evaluate.py --compare weights/yolo11s-ball.pt weights/yolo11s-ball-xtu.pt \
+       --data finetune/dataset/data.yaml
+```
+
+采集规范、标注规范、工时估算、验收指标与迭代方法见 **[finetune/README.md](finetune/README.md)**。
+
+> 预标注能省掉"从零打框"，人工只做修正，实测可省约 70~80% 标注工时——
+> 这是小团队能把几千帧数据做下来的关键。
+
+微调所需的额外依赖：`torch`（CPU 版即可跑通流程）、`ultralytics`、`matplotlib`、`pandas`、`polars`。
+
 覆盖：依赖 / RK4 终端速度 / 落地三重触发 + 兜底 / 场地判罚 / 全链路模拟 / 单视频流水线。
 当前状态：**6/6 PASS**（3D 误差 18.9mm，落点判罚正确，轨迹 R²=0.999）。
 
