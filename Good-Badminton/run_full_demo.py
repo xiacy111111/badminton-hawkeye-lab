@@ -236,7 +236,7 @@ class HawkEyeSystem:
         print("  模拟模式 — 全链路集成测试")
         print("=" * 60)
 
-        stereo = VirtualStereoCamera()
+        stereo = VirtualStereoCamera(baseline=13.4, cam_dist=2.5, cam_h=3.0)
         noise_model = DynamicNoiseModel()
         np.random.seed(42)
 
