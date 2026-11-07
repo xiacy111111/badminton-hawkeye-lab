@@ -27,3 +27,5 @@ finetune/dataset/
 finetune/dataset_*/
 finetune/*.pt
 finetune/eval_report.json
+calib_single_cam.json
+outputs/court_3d.png

@@ -511,6 +511,32 @@ python finetune/evaluate.py --compare weights/yolo11s-ball.pt weights/yolo11s-ba
 
 微调所需的额外依赖：`torch`（CPU 版即可跑通流程）、`ultralytics`、`matplotlib`、`pandas`、`polars`。
 
+
+### 八、单机位快速上手（推荐工作流）
+
+固定一个机位后，**标定只做一次，之后所有视频自动复用**：
+
+```bash
+# 第一次：自动检测（失败就加 --corners 手动点四角）
+python video_pipeline.py 第一段视频.mp4
+#   → 四角存进 calib_single_cam.json
+
+# 之后：同机位的所有视频直接跑，自动读标定
+python video_pipeline.py 第二段视频.mp4
+```
+
+窗口里同样如此：标定成功会提示「同机位下次自动复用」；换场地/换机位时点
+「清除标定」，再重新自动检测或点四角。
+
+```
+[球场] 复用已保存的单机位标定（…/calib_single_cam.json）
+[球场] 复用标定四点（固定机位无需重复标定）
+[检测] 使用 YOLO 球检测模型（imgsz=1280, conf=0.15）
+```
+
+**单机位机位摆放三条硬性要求**（详见 [finetune/README.md](finetune/README.md) 第二节）：
+双打场地四角全在画面内、球网完整可见、球在画面里不能只有 2~3 像素。
+
 覆盖：依赖 / RK4 终端速度 / 落地三重触发 + 兜底 / 场地判罚 / 全链路模拟 / 单视频流水线。
 当前状态：**6/6 PASS**（3D 误差 18.9mm，落点判罚正确，轨迹 R²=0.999）。
 

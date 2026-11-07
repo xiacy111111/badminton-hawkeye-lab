@@ -122,6 +122,8 @@ class HawkEyeApp:
                      width=8, state="readonly").pack(side="left", padx=(6, 18))
         self.btn_corner = self._btn(opt, "手动标定球场", self.open_corner_picker, kind="ghost")
         self.btn_corner.pack(side="left", padx=(0, 10))
+        self.btn_clear = self._btn(opt, "清除标定", self.clear_calib, kind="ghost")
+        self.btn_clear.pack(side="left", padx=(0, 10))
         self.btn_play = self._btn(opt, "播放标注视频", self.open_video, kind="ghost")
         self.btn_play.pack(side="left")
 
@@ -363,6 +365,24 @@ class HawkEyeApp:
         win.bind("<BackSpace>", on_undo)
         win.transient(self.root)
         win.grab_set()
+
+    def clear_calib(self):
+        """删除已保存的单机位标定（换机位/换场地时先清一次）。"""
+        import os as _os
+        try:
+            from video_pipeline import DEFAULT_CALIB
+        except Exception:
+            DEFAULT_CALIB = "calib_single_cam.json"
+        self.manual_corners = None
+        if _os.path.exists(DEFAULT_CALIB):
+            try:
+                _os.remove(DEFAULT_CALIB)
+                self._log(f"已删除保存的标定：{DEFAULT_CALIB}", "ok")
+            except Exception as e:
+                self._log(f"删除失败：{e}", "err")
+        else:
+            self._log("当前没有保存的标定文件。", "dim")
+        self._log("下次「开始分析」将重新自动检测球场，或用「手动标定球场」点四个角。", "dim")
 
     def open_out(self):
         target = self.out_dir or BASE

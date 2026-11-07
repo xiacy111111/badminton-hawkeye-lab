@@ -5,7 +5,16 @@
 
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
+import os as _os
+# 默认无窗口后端：避免在脚本/服务里 plt.show() 阻塞整个流程
+# 需要弹出交互窗口时设环境变量 HAWKEYE_GUI=1
+if _os.environ.get("HAWKEYE_GUI") == "1":
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        matplotlib.use("Agg")
+else:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import matplotlib.animation as animation
@@ -399,8 +408,17 @@ class Court3D:
         plt.close(self.fig)
         print(f"[OK] {path}")
 
-    def show(self):
-        plt.tight_layout(); plt.show()
+    def show(self, save_if_headless: str = "outputs/court_3d.png"):
+        plt.tight_layout()
+        if matplotlib.get_backend().lower() == "agg":
+            # 无窗口后端：保存成图片，绝不阻塞
+            _os.makedirs(_os.path.dirname(save_if_headless) or ".", exist_ok=True)
+            self.fig.savefig(save_if_headless, dpi=160,
+                             facecolor=self._c["bg"], bbox_inches="tight")
+            plt.close(self.fig)
+            print(f"[OK] 无窗口环境，3D 视图已保存: {save_if_headless}")
+            return
+        plt.show()
 
 
 # ============================================================

@@ -416,6 +416,35 @@ def extrapolate_landing(court_pts: List[Tuple[float, float, float]],
 # ══════════════════════════════════════════════════════════════
 # 4-6. 主流程
 # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# 单机位标定复用：固定机位只需标定一次，之后直接读 JSON
+# ══════════════════════════════════════════════════════════════
+DEFAULT_CALIB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "calib_single_cam.json")
+
+
+def save_calib(corners, path: str = DEFAULT_CALIB, meta: Optional[Dict] = None):
+    data = {"corners": [[float(x), float(y)] for x, y in corners],
+            "meta": meta or {}}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_calib(path: str = DEFAULT_CALIB):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        c = d.get("corners")
+        if c and len(c) == 4:
+            return np.array(c, dtype=np.float32)
+    except Exception:
+        pass
+    return None
+
+
 def _ffmpeg_path() -> Optional[str]:
     for name in ("ffmpeg", "ffmpeg.exe"):
         try:
@@ -467,7 +496,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   make_video: bool = True,
                   max_frames: Optional[int] = None,
                   manual_corners: Optional[List[List[float]]] = None,
-                  detector: str = "auto") -> Dict:
+                  detector: str = "auto",
+                  calib_file: Optional[str] = None) -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -497,12 +527,19 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         + (f"（只处理前 {max_frames} 帧）" if max_frames else ""))
     result.update(fps=round(fps, 2), frames=n_total, size=[w, h])
 
-    # ---- 1. 球场（手动四点优先，其次自动检测）----
+    # ---- 1. 球场（手动四点 > 已保存标定 > 自动检测）----
+    saved = load_calib(calib_file or DEFAULT_CALIB)
+    reused = False
+    if not (manual_corners and len(manual_corners) == 4) and saved is not None:
+        manual_corners = saved.tolist()
+        reused = True
+        log(f"  [球场] 复用已保存的单机位标定（{calib_file or DEFAULT_CALIB}）")
     if manual_corners and len(manual_corners) == 4:
         corners = _canonical_quad(np.array(manual_corners, dtype=np.float32))
         court_info = {"attempted": 0, "success": True, "score": 1.0,
-                      "frame": 0, "source": "manual"}
-        log("  [球场] 使用手动标定的四点")
+                      "frame": 0, "source": "reused" if reused else "manual"}
+        log("  [球场] 复用标定四点（固定机位无需重复标定）" if reused
+            else "  [球场] 使用手动标定的四点")
     else:
         corners, court_info = detect_court(vp, log=log, max_frames=max_frames)
         if corners is not None:
@@ -512,6 +549,14 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         H, (CW, CL) = build_homography(corners, mode)
         result["stages"]["court"] = {"ok": True, **court_info,
                                      "corners": corners.astype(float).tolist()}
+        # 固定机位：把这套角点存下来，后续同机位视频可跳过标定
+        try:
+            cp = save_calib(corners, calib_file or DEFAULT_CALIB,
+                            meta={"source": court_info.get("source", "auto"),
+                                  "from_video": os.path.basename(video_path)})
+            log(f"  [球场] 标定已保存：{cp}（同机位下次自动复用）")
+        except Exception as e:
+            log(f"  [球场] 标定保存失败：{e}")
     else:
         result["stages"]["court"] = {"ok": False, **court_info}
 
@@ -602,28 +647,33 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         ext = extrapolate_landing(court_pts, frames_ahead=min(8, max(4, len(main_track) // 8)))
         # 主判罚用「最后观测点」：真实视频中球在落地瞬间失联，末点即落点
         use = (obs[1], obs[2])
-        if not (-0.3 * CW <= use[0] <= 1.3 * CW and -0.3 * CL <= use[1] <= 1.3 * CL):
+        plausible = (-0.3 * CW <= use[0] <= 1.3 * CW and -0.3 * CL <= use[1] <= 1.3 * CL)
+        if not plausible:
             # 单应变换只对地平面(z=0)成立：球若仍在空中，映射必然离谱。
             log(f"  [落点] 映射结果 ({use[0]:.1f}, {use[1]:.1f}) m 远超场地范围 —— "
                 "本段轨迹未跟到落地（球仍在空中），不给出落点判罚")
             result["stages"]["landing"] = {"ok": False, "reason": "still_in_flight",
-                                           "raw_court_xy": [round(use[0], 3), round(use[1], 3)]}
+                                           "raw_court_xy": [round(use[0], 3),
+                                                            round(use[1], 3)]}
             landing = None
-        j = judge.judge(use[0], use[1])
-        landing = {"frame": last_f,
-                   "court_xy": [round(use[0], 3), round(use[1], 3)],
-                   "judge": j,
-                   "method": "last_observed",
-                   "image_xy": [round(lx, 1), round(ly, 1)],
-                   "estimated": True}
-        # 外推值仅作参考（轨迹明显未走完时更接近真实落点）
-        if ext is not None and -0.3 * CW <= ext[0] <= 1.3 * CW and -0.3 * CL <= ext[1] <= 1.3 * CL:
-            ej = judge.judge(ext[0], ext[1])
-            landing["extrapolated_court_xy"] = [round(ext[0], 3), round(ext[1], 3)]
-            landing["extrapolated_judge"] = ej["result"]
-            log(f"  [落点] 参考外推: ({ext[0]:.2f}, {ext[1]:.2f}) m → {ej['result']}（仅供参考）")
-        log(f"  [落点] 球场坐标 ({use[0]:.2f}, {use[1]:.2f}) m → {j['result']}"
-            f"（压线裕度 {j['margin_mm']} mm，末观测点估算）")
+        else:
+            j = judge.judge(use[0], use[1])
+            landing = {"frame": last_f,
+                       "court_xy": [round(use[0], 3), round(use[1], 3)],
+                       "judge": j,
+                       "method": "last_observed",
+                       "image_xy": [round(lx, 1), round(ly, 1)],
+                       "estimated": True}
+            # 外推值仅作参考（轨迹明显未走完时更接近真实落点）
+            if ext is not None and -0.3 * CW <= ext[0] <= 1.3 * CW and \
+                    -0.3 * CL <= ext[1] <= 1.3 * CL:
+                ej = judge.judge(ext[0], ext[1])
+                landing["extrapolated_court_xy"] = [round(ext[0], 3), round(ext[1], 3)]
+                landing["extrapolated_judge"] = ej["result"]
+                log(f"  [落点] 参考外推: ({ext[0]:.2f}, {ext[1]:.2f}) m → "
+                    f"{ej['result']}（仅供参考）")
+            log(f"  [落点] 球场坐标 ({use[0]:.2f}, {use[1]:.2f}) m → {j['result']}"
+                f"（压线裕度 {j['margin_mm']} mm，末观测点估算）")
     else:
         log("  [落点] 无球场标定，跳过落点判罚（仅输出轨迹）")
         result["stages"]["landing"] = {"ok": False, "reason": "no_court_calib"}
@@ -805,6 +855,10 @@ if __name__ == "__main__":
     ap.add_argument("--demo", action="store_true", help="生成合成演示视频并分析")
     ap.add_argument("--mode", default="doubles", choices=["doubles", "singles"])
     ap.add_argument("--max-frames", type=int, default=600)
+    ap.add_argument("--calib", type=str, default=None,
+                    help="标定文件路径（存在则复用；默认 calib_single_cam.json）")
+    ap.add_argument("--no-reuse-calib", action="store_true",
+                    help="忽略已保存标定，强制重新检测/手动标定")
     ap.add_argument("--detector", default="auto", choices=["auto", "motion", "yolo"],
                     help="检测器：auto=有YOLO权重就用YOLO")
     ap.add_argument("--corners", type=str, default=None,
@@ -823,4 +877,5 @@ if __name__ == "__main__":
               for pair in args.corners.replace(" ", "").split(";") if pair]
         print(f"[手动标定] 四点: {mc}")
     analyze_video(vp, mode=args.mode, max_frames=args.max_frames,
-                  manual_corners=mc, detector=args.detector)
+                  manual_corners=mc, detector=args.detector,
+                  calib_file=None if args.no_reuse_calib else (args.calib or None))

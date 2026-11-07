@@ -367,7 +367,12 @@ class HawkEyeSystem:
             print(f"\n  正在播放 3D 轨迹动画...")
             self.court_3d.show()
             if judgments:
-                self.court_3d.zoom_to_landing()
+                # 传入最后一个落点坐标（原代码漏传参数，会抛 TypeError）
+                try:
+                    _name, _pos, _j = judgments[-1]
+                    self.court_3d.zoom_to_landing(float(_pos[0]), float(_pos[1]))
+                except Exception:
+                    pass
 
         print("=" * 60)
 
