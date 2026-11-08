@@ -29,3 +29,7 @@ finetune/*.pt
 finetune/eval_report.json
 calib_single_cam.json
 outputs/court_3d.png
+
+# 调试图与本地视频备份（不入库）
+_debug_outputs/
+badminton-videos-backup/
