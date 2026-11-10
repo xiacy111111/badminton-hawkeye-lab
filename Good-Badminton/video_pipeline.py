@@ -131,7 +131,15 @@ def detect_court(video_path: str, max_samples: int = 18,
         quad = _canonical_quad(c)
         area = cv2.contourArea(quad.astype(np.float32))
         score = area / (h * w)                      # 占画面比例
-        if 0.05 < score < 0.98 and score > best_score:
+        # 几何自检：真实球场在画面里通常占 12% 以上；且透视必有"近端宽 > 远端宽"
+        far_w = float(np.linalg.norm(quad[1] - quad[0]))
+        near_w = float(np.linalg.norm(quad[2] - quad[3]))
+        ratio = near_w / max(far_w, 1e-6)
+        geom_ok = (0.15 < score < 0.98) and (1.15 <= ratio <= 5.0)
+        if not geom_ok and score > 0.02:
+            log(f"  [球场] 候选四边形被几何自检否决"
+                f"（占比 {score*100:.0f}%，近/远端宽度比 {ratio:.2f}）")
+        if geom_ok and score > best_score:
             best, best_score = quad, score
             info["frame"] = int(i)
 
@@ -497,7 +505,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   max_frames: Optional[int] = None,
                   manual_corners: Optional[List[List[float]]] = None,
                   detector: str = "auto",
-                  calib_file: Optional[str] = None) -> Dict:
+                  calib_file: Optional[str] = None,
+                  reuse_calib: bool = False) -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -531,9 +540,28 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     saved = load_calib(calib_file or DEFAULT_CALIB)
     reused = False
     if not (manual_corners and len(manual_corners) == 4) and saved is not None:
+        # 校验：分辨率不同必然不是同一机位，直接作废重检
+        meta = {}
+        try:
+            with open(calib_file or DEFAULT_CALIB, encoding="utf-8") as _f:
+                meta = json.load(_f).get("meta", {}) or {}
+        except Exception:
+            pass
+        fs = meta.get("frame_size")
+        if fs and [int(w), int(h)] != [int(fs[0]), int(fs[1])]:
+            log(f"  [球场] 已保存标定来自 {fs[0]}x{fs[1]} 的画面，与当前 "
+                f"{int(w)}x{int(h)} 不符 → 作废，重新检测")
+            saved = None
+        elif not reuse_calib:
+            log("  [球场] 已保存标定存在，但本次未要求复用 → 重新检测"
+                "（同机位可加 --reuse-calib 跳过检测）")
+            saved = None
+        else:
+            log("  [球场] 复用已保存标定（假定与保存时是同一机位/同一场地，"
+                "换过机位请点「清除标定」或加 --no-reuse-calib）")
+    if saved is not None and not (manual_corners and len(manual_corners) == 4):
         manual_corners = saved.tolist()
         reused = True
-        log(f"  [球场] 复用已保存的单机位标定（{calib_file or DEFAULT_CALIB}）")
     if manual_corners and len(manual_corners) == 4:
         corners = _canonical_quad(np.array(manual_corners, dtype=np.float32))
         court_info = {"attempted": 0, "success": True, "score": 1.0,
@@ -553,7 +581,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         try:
             cp = save_calib(corners, calib_file or DEFAULT_CALIB,
                             meta={"source": court_info.get("source", "auto"),
-                                  "from_video": os.path.basename(video_path)})
+                                  "from_video": os.path.basename(video_path),
+                                  "frame_size": [int(w), int(h)]})
             log(f"  [球场] 标定已保存：{cp}（同机位下次自动复用）")
         except Exception as e:
             log(f"  [球场] 标定保存失败：{e}")
@@ -642,6 +671,18 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         for f, x, y in main_track:
             cx_, cy_ = img_to_court(H, (x, y))
             court_pts.append((float(f), cx_, cy_))
+
+        # 标定自洽性：若多数轨迹点映射后远超球场，说明标定本身错了 → 不判罚
+        inb = sum(1 for _, cx_, cy_ in court_pts
+                  if -0.5 * CW <= cx_ <= 1.5 * CW and -0.5 * CL <= cy_ <= 1.5 * CL)
+        ratio_in = inb / max(len(court_pts), 1)
+        if ratio_in < 0.6:
+            log(f"  [落点] 轨迹只有 {ratio_in*100:.0f}% 的点映射在球场附近 → "
+                "球场标定与轨迹不自洽，本次不判罚（请检查/重做标定）")
+            result["stages"]["landing"] = {"ok": False, "reason": "calib_inconsistent",
+                                           "in_court_ratio": round(ratio_in, 3)}
+            landing = None
+            return _finish(result, out_dir, None, log, t0)
 
         obs = court_pts[-1]
         ext = extrapolate_landing(court_pts, frames_ahead=min(8, max(4, len(main_track) // 8)))
@@ -857,6 +898,8 @@ if __name__ == "__main__":
     ap.add_argument("--max-frames", type=int, default=600)
     ap.add_argument("--calib", type=str, default=None,
                     help="标定文件路径（存在则复用；默认 calib_single_cam.json）")
+    ap.add_argument("--reuse-calib", action="store_true",
+                    help="复用已保存标定（同机位同场地时才用，可跳过检测）")
     ap.add_argument("--no-reuse-calib", action="store_true",
                     help="忽略已保存标定，强制重新检测/手动标定")
     ap.add_argument("--detector", default="auto", choices=["auto", "motion", "yolo"],
@@ -878,4 +921,5 @@ if __name__ == "__main__":
         print(f"[手动标定] 四点: {mc}")
     analyze_video(vp, mode=args.mode, max_frames=args.max_frames,
                   manual_corners=mc, detector=args.detector,
-                  calib_file=None if args.no_reuse_calib else (args.calib or None))
+                  calib_file=None if args.no_reuse_calib else (args.calib or None),
+                  reuse_calib=bool(args.reuse_calib))

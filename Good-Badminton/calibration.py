@@ -391,9 +391,14 @@ def _detect_court_line_segments(image):
         angle = _line_angle(x1, y1, x2, y2)
         seg = {"points": (x1, y1, x2, y2), "length": length,
                "mid": ((x1 + x2) / 2.0, (y1 + y2) / 2.0), "angle": angle}
-        if min(angle, 180 - angle) <= 16:
+        # 角度约定：0°=水平，90°=垂直，范围 [0,180)。
+        # 关键修正：低机位/广角下球场边线可能只偏离水平 18°~25°
+        # （如 159° 实为上升 21° 的边线），原来的固定区间会把它们判成横线。
+        # 因此只把"几乎水平"(≤12°) 归为横线，其余一律进侧线桶，由四边形评分筛选。
+        dev = min(angle, 180 - angle)
+        if dev <= 12:
             horizontal.append(seg)
-        elif 45 <= angle <= 135:
+        else:
             side.append(seg)
     return _dedupe_lines(horizontal, "horizontal", 14), _dedupe_lines(side, "side", 18), mask
 

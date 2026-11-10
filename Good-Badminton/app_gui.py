@@ -60,6 +60,7 @@ class HawkEyeApp:
         self.var_mode = tk.StringVar(value="双打")
         self.var_frames = tk.StringVar(value="600")
         self.var_detector = tk.StringVar(value="自动")
+        self.var_reuse = tk.BooleanVar(value=False)
         self.manual_corners = None
 
         root.title("羽毛球鹰眼分析台 · Badminton Hawk-Eye")
@@ -122,6 +123,10 @@ class HawkEyeApp:
                      width=8, state="readonly").pack(side="left", padx=(6, 18))
         self.btn_corner = self._btn(opt, "手动标定球场", self.open_corner_picker, kind="ghost")
         self.btn_corner.pack(side="left", padx=(0, 10))
+        tk.Checkbutton(opt, text="复用标定", variable=self.var_reuse, bg=C_BG, fg=C_SUB,
+                       selectcolor=C_CARD, activebackground=C_BG, activeforeground=C_TEXT,
+                       font=("Microsoft YaHei UI", 9),
+                       bd=0, highlightthickness=0).pack(side="left", padx=(0, 10))
         self.btn_clear = self._btn(opt, "清除标定", self.clear_calib, kind="ghost")
         self.btn_clear.pack(side="left", padx=(0, 10))
         self.btn_play = self._btn(opt, "播放标注视频", self.open_video, kind="ghost")
@@ -263,6 +268,7 @@ class HawkEyeApp:
             res = analyze_video(self.video_path, mode=mode, max_frames=max_frames,
                                 detector=det_map.get(self.var_detector.get(), "auto"),
                                 manual_corners=self.manual_corners,
+                                reuse_calib=bool(self.var_reuse.get()),
                                 log=lambda m: self.q.put(("log", m)))
             if res.get("preview"):
                 self.q.put(("preview", res["preview"]))
