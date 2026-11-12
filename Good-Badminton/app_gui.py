@@ -90,7 +90,7 @@ class HawkEyeApp:
         menubar.add_cascade(label="模块", menu=m_mod)
 
         m_judge = tk.Menu(menubar, tearoff=0)
-        m_judge.add_command(label="完整判罚流程（当前界面）", command=self.start_analysis)
+        m_judge.add_command(label="自研流程（实验：仅轨迹+落点）", command=self.start_analysis)
         m_judge.add_separator()
         m_judge.add_command(label="秒判罚（规划中）", state="disabled")
         m_judge.add_command(label="秒回溯（规划中）", state="disabled")
@@ -250,10 +250,11 @@ class HawkEyeApp:
         bar = tk.Frame(self.root, bg=C_BG)
         bar.pack(fill="x", padx=22)
         self.btn_choose = self._btn(bar, "选择视频", self.select_file, kind="ghost")
-        self.btn_run = self._btn(bar, "开始分析", self.start_analysis, kind="primary")
+        self.btn_run = self._btn(bar, "① 导入视频", self.select_file, kind="ghost")
+        self.btn_start = self._btn(bar, "② 开始分析", self.run_upstream_analysis, kind="primary")
         self.btn_sim = self._btn(bar, "模拟全链路演示", self.run_simulate, kind="ghost")
         self.btn_open = self._btn(bar, "打开输出目录", self.open_out, kind="ghost")
-        for b in (self.btn_choose, self.btn_run, self.btn_sim, self.btn_open):
+        for b in (self.btn_run, self.btn_start, self.btn_sim, self.btn_open):
             b.pack(side="left", padx=(0, 10))
 
         self.status = tk.Label(bar, text="就绪", bg=C_BG, fg=C_SUB,
@@ -395,7 +396,7 @@ class HawkEyeApp:
         self.video_path = path
         self._draw_dropzone()
         self._log(f"已选择视频：{path}", "ok")
-        self.status.config(text="已就绪，点「开始分析」", fg=C_ACCENT)
+        self.status.config(text="已就绪：导入视频 → 点「开始分析」", fg=C_ACCENT)
 
     def select_file(self):
         p = filedialog.askopenfilename(
@@ -603,7 +604,7 @@ class HawkEyeApp:
 
     def _toggle_buttons(self, enabled):
         state = "normal" if enabled else "disabled"
-        for b in (self.btn_choose, self.btn_run, self.btn_sim):
+        for b in (self.btn_run, self.btn_start, self.btn_sim):
             b.config(state=state)
 
     # ══════════════════════════════════════════
