@@ -61,6 +61,7 @@ class HawkEyeApp:
         self.var_frames = tk.StringVar(value="600")
         self.var_detector = tk.StringVar(value="自动")
         self.var_reuse = tk.BooleanVar(value=False)
+        self.var_skip_calib = tk.BooleanVar(value=False)
         self.manual_corners = None
 
         root.title("羽毛球鹰眼分析台 · Badminton Hawk-Eye")
@@ -123,6 +124,10 @@ class HawkEyeApp:
                      width=8, state="readonly").pack(side="left", padx=(6, 18))
         self.btn_corner = self._btn(opt, "手动标定球场", self.open_corner_picker, kind="ghost")
         self.btn_corner.pack(side="left", padx=(0, 10))
+        tk.Checkbutton(opt, text="仅轨迹(不判罚)", variable=self.var_skip_calib, bg=C_BG,
+                       fg=C_SUB, selectcolor=C_CARD, activebackground=C_BG,
+                       activeforeground=C_TEXT, font=("Microsoft YaHei UI", 9),
+                       bd=0, highlightthickness=0).pack(side="left", padx=(0, 10))
         tk.Checkbutton(opt, text="复用标定", variable=self.var_reuse, bg=C_BG, fg=C_SUB,
                        selectcolor=C_CARD, activebackground=C_BG, activeforeground=C_TEXT,
                        font=("Microsoft YaHei UI", 9),
@@ -245,11 +250,33 @@ class HawkEyeApp:
         if p:
             self._set_video(p)
 
+    def _has_calibration(self) -> bool:
+        """是否已有可用标定（手动四点或本地标定文件）。"""
+        if self.manual_corners:
+            return True
+        try:
+            from video_pipeline import DEFAULT_CALIB
+            import os as _os
+            return _os.path.exists(DEFAULT_CALIB)
+        except Exception:
+            return False
+
+    def _needs_calibration(self) -> bool:
+        """是否需要先标定：有视频、未标定、且未勾选「仅轨迹」。"""
+        return bool(self.video_path) and not self._has_calibration() \
+            and not bool(self.var_skip_calib.get())
+
     def start_analysis(self):
         if self.busy:
             return
         if not self.video_path:
             messagebox.showinfo("提示", "先拖一个视频进来，或点「选择视频」。")
+            return
+        # 强制标定：没有标定就不许判罚，先带你点四个角
+        if self._needs_calibration():
+            self._log("尚未标定球场：请在弹出的窗口里依次点击球场四角"
+                      "（左上→右上→右下→左下）。", "warn")
+            self.open_corner_picker(on_done=self.start_analysis)
             return
         self.busy = True
         self._toggle_buttons(False)
@@ -269,6 +296,7 @@ class HawkEyeApp:
                                 detector=det_map.get(self.var_detector.get(), "auto"),
                                 manual_corners=self.manual_corners,
                                 reuse_calib=bool(self.var_reuse.get()),
+                                skip_landing=bool(self.var_skip_calib.get()),
                                 log=lambda m: self.q.put(("log", m)))
             if res.get("preview"):
                 self.q.put(("preview", res["preview"]))
@@ -305,7 +333,7 @@ class HawkEyeApp:
             self.q.put(("log", "✗ 模拟失败：\n" + traceback.format_exc()))
             self.q.put(("done", {"ok": False}))
 
-    def open_corner_picker(self):
+    def open_corner_picker(self, on_done=None):
         """弹出首帧，让用户依次点击球场四角（左上/右上/右下/左下）。"""
         if not self.video_path:
             messagebox.showinfo("提示", "先选一个视频。")
@@ -359,8 +387,10 @@ class HawkEyeApp:
             if len(pts) == 4:
                 self.manual_corners = [[x / scale, y / scale] for x, y in pts]
                 self._log(f"手动标定完成：{[f'({int(x)},{int(y)})' for x, y in self.manual_corners]}", "ok")
-                self._log("重新点「开始分析」即用手动四点做落点判罚。", "dim")
+                self._log("标定完成，继续分析…", "ok")
                 win.destroy()
+                if on_done is not None:
+                    self.root.after(150, on_done)
 
         def on_undo(_e):
             if pts:

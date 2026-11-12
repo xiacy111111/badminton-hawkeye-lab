@@ -19,6 +19,7 @@ video_pipeline.py — 单视频自动识别流水线（无需模型权重，纯 
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -500,6 +501,37 @@ def load_ball_csv(csv_path: str, scale_x: float = 1.0, scale_y: float = 1.0,
     return [per.get(i, []) for i in range(max(per) + 1)]
 
 
+def fuse_detections(model_pf: List[List[Tuple[float, float, float]]],
+                    csv_pf: List[List[Tuple[float, float, float]]],
+                    gate_px: float = 24.0) -> List[List[Tuple[float, float, float]]]:
+    """双源融合：TrackNet（时序、少误检）为主，YOLO 补孤点。
+
+    规则（逐帧）：
+      · TrackNet 有检出 → 以其为准；YOLO 的点若距最近 TrackNet 点 > gate_px 也保留
+        （可能是 TrackNet 漏掉的快球），但每帧最多补 1 个，避免误检灌入；
+      · TrackNet 无检出 → 完全采用 YOLO。
+    """
+    n = max(len(model_pf), len(csv_pf))
+    out: List[List[Tuple[float, float, float]]] = []
+    for i in range(n):
+        m = model_pf[i] if i < len(model_pf) else []
+        c = csv_pf[i] if i < len(csv_pf) else []
+        if not c:
+            out.append(list(m))
+            continue
+        merged = list(c)
+        added = 0
+        for (mx, my, ms) in m:
+            if added >= 1:
+                break
+            d = min((math.hypot(mx - cx, my - cy) for cx, cy, _ in c), default=1e9)
+            if d > gate_px:
+                merged.append((mx, my, ms))
+                added += 1
+        out.append(merged)
+    return out
+
+
 def _ffmpeg_path() -> Optional[str]:
     for name in ("ffmpeg", "ffmpeg.exe"):
         try:
@@ -555,7 +587,9 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   calib_file: Optional[str] = None,
                   reuse_calib: bool = False,
                   tracker: str = "refined",
-                  ball_csv: Optional[str] = None) -> Dict:
+                  ball_csv: Optional[str] = None,
+                  fuse_csv: bool = False,
+                  skip_landing: bool = False) -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -638,6 +672,16 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     else:
         result["stages"]["court"] = {"ok": False, **court_info}
 
+    # 标定置信度：自动检测出的四边形若只占画面一小块，多半是"子区域"误拟合
+    calib_confident = True
+    if corners is not None and (court_info.get("source") == "auto"):
+        area_ratio = float(court_info.get("score", 0.0))
+        if area_ratio < 0.30:
+            calib_confident = False
+            log(f"  [球场] 标定置信度低（仅占画面 {area_ratio*100:.0f}%）："
+                "本次不用于轨迹门控与落点判罚，请用「手动标定球场」点四个角")
+            result["stages"]["court"]["low_confidence"] = True
+
     # ---- 2. 逐帧检测：TrackNet CSV 优先，否则 YOLO / 运动检测 ----
     per_frame: List[List[Tuple[float, float, float]]] = []
     keep_frames: List[np.ndarray] = []
@@ -665,6 +709,24 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         det_cov_before = det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
         log(f"  [检测] 使用 TrackNetV3 CSV：{n} 帧，候选点 {n_cand} 个，"
             f"有检出帧占比 {det_cov_after*100:.0f}%（坐标已按 {sx:.2f}× 缩放）")
+        if fuse_csv and YoloBallDetector.is_available():
+            try:
+                _yd = YoloBallDetector()
+                _mpf = []
+                for _fr in keep_frames:
+                    _g = cv2.cvtColor(_fr, cv2.COLOR_BGR2GRAY)
+                    _mpf.append(_yd.detect(_fr, _g))
+                before = det_cov_after
+                per_frame = fuse_detections(_mpf, per_frame)
+                n_cand = sum(len(p) for p in per_frame)
+                det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
+                log(f"  [检测] 双源融合完成（TrackNet + YOLO）：候选点 {n_cand} 个，"
+                    f"有检出帧占比 {before*100:.0f}% → {det_cov_after*100:.0f}%")
+                _st = result["stages"].setdefault("detect", {})
+                _st.update({"fused": True, "candidates": n_cand,
+                            "frame_coverage": round(det_cov_after, 3)})
+            except Exception as e:
+                log(f"  [检测] 融合失败（{e}），仅用 TrackNet")
         result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand,
                                       "detector": "tracknet_csv",
                                       "frame_coverage": round(det_cov_after, 3)}
@@ -724,7 +786,7 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
 
     # ---- 3. 轨迹串联（NN 基线 vs 时序补全）+ 抛物线筛选 ----
     in_court_fn = None
-    if H is not None:
+    if H is not None and calib_confident:
         margin_x, margin_y = 1.0, 1.5   # 允许球出界一小段（界外球也是球）
 
         def in_court_fn(px, py, _H=H, _mx=margin_x, _my=margin_y):
@@ -787,8 +849,20 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
 
     # ---- 4. 落点：观测值 + 外推值双重估计 ----
     landing = None
+    if skip_landing:
+        log("  [落点] 已按要求跳过判罚（仅输出轨迹）")
+        result["stages"]["landing"] = {"ok": False, "reason": "skipped_by_user"}
+        landing = None
+        _skip = True
+    else:
+        _skip = False
     last_f, lx, ly = main_track[-1]
-    if H is not None:
+    if H is not None and not calib_confident and not _skip:
+        log("  [落点] 标定置信度不足，跳过落点判罚（请重做手动标定）")
+        result["stages"]["landing"] = {"ok": False, "reason": "low_confidence_calib"}
+        _skip = True
+
+    if H is not None and not _skip:
         judge = CourtJudge(mode=mode)
         court_pts = []
         for f, x, y in main_track:
@@ -838,7 +912,7 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                     f"{ej['result']}（仅供参考）")
             log(f"  [落点] 球场坐标 ({use[0]:.2f}, {use[1]:.2f}) m → {j['result']}"
                 f"（压线裕度 {j['margin_mm']} mm，末观测点估算）")
-    else:
+    elif not _skip:
         log("  [落点] 无球场标定，跳过落点判罚（仅输出轨迹）")
         result["stages"]["landing"] = {"ok": False, "reason": "no_court_calib"}
     if landing:
@@ -1025,6 +1099,8 @@ if __name__ == "__main__":
                     help="复用已保存标定（同机位同场地时才用，可跳过检测）")
     ap.add_argument("--no-reuse-calib", action="store_true",
                     help="忽略已保存标定，强制重新检测/手动标定")
+    ap.add_argument("--fuse-csv", action="store_true",
+                    help="同时用 YOLO 补 TrackNet 的漏检（双源融合）")
     ap.add_argument("--ball-csv", default=None,
                     help="TrackNetV3 输出的逐帧球坐标 CSV（提供则跳过模型检测）")
     ap.add_argument("--tracker", default="refined", choices=["refined", "nn"],
@@ -1050,4 +1126,5 @@ if __name__ == "__main__":
                   manual_corners=mc, detector=args.detector,
                   calib_file=None if args.no_reuse_calib else (args.calib or None),
                   reuse_calib=bool(args.reuse_calib),
-                  tracker=args.tracker, ball_csv=args.ball_csv)
+                  tracker=args.tracker, ball_csv=args.ball_csv,
+                  fuse_csv=bool(args.fuse_csv))

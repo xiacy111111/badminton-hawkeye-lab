@@ -101,8 +101,12 @@ def t_video_pipeline():
     tmpdir = tempfile.mkdtemp(prefix="hawkeye_selftest_")
     vp = os.path.join(tmpdir, "demo.mp4")
     make_demo_video(vp, n_frames=80)
+    # 合成视频的球场四角是已知的（make_demo_video 里 warp 的目标四边形），
+    # 直接作为手动标定传入，避免依赖自动标定的置信度判定
+    demo_corners = [[430, 140], [850, 140], [1030, 640], [250, 640]]
     res = analyze_video(vp, out_dir=os.path.join(tmpdir, "out"), max_frames=80,
-                        log=lambda m: None, make_video=False)
+                        log=lambda m: None, make_video=False,
+                        manual_corners=demo_corners)
     st = res["stages"]
     assert st.get("court", {}).get("ok"), "球场检测失败"
     assert st.get("track", {}).get("ok"), "轨迹未形成"
