@@ -69,6 +69,7 @@ class HawkEyeApp:
         root.minsize(900, 700)
         root.configure(bg=C_BG)
 
+        self._build_menu()
         self._build_ui()
         self._hook_drop()
         self.root.after(120, self._poll_queue)
@@ -76,6 +77,122 @@ class HawkEyeApp:
     # ══════════════════════════════════════════
     # UI
     # ══════════════════════════════════════════
+    def _build_menu(self):
+        """主菜单：两个核心模块 + 判罚（二级菜单，实验功能）。"""
+        menubar = tk.Menu(self.root)
+
+        m_mod = tk.Menu(menubar, tearoff=0)
+        m_mod.add_command(label="轨迹与速度检测", command=self.run_speed_module)
+        m_mod.add_command(label="运动员姿态检测", command=self.run_pose_module)
+        menubar.add_cascade(label="模块", menu=m_mod)
+
+        m_judge = tk.Menu(menubar, tearoff=0)
+        m_judge.add_command(label="完整判罚流程（当前界面）", command=self.start_analysis)
+        m_judge.add_separator()
+        m_judge.add_command(label="秒判罚（规划中）", state="disabled")
+        m_judge.add_command(label="秒回溯（规划中）", state="disabled")
+        menubar.add_cascade(label="判罚（实验）", menu=m_judge)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="使用说明", command=self.open_guide)
+        menubar.add_cascade(label="帮助", menu=m_help)
+
+        self.root.config(menu=menubar)
+
+    def open_guide(self):
+        for p in (BASE.parent / "使用说明.md", BASE / "使用说明.md"):
+            if p.exists():
+                try:
+                    os.startfile(str(p))
+                    return
+                except Exception:
+                    pass
+        messagebox.showinfo("提示", "未找到 使用说明.md")
+
+    # ── 模块入口 ────────────────────────────────
+    def _require_video(self) -> bool:
+        if not self.video_path:
+            messagebox.showinfo("提示", "先拖一个视频进来，或点「选择视频」。")
+            return False
+        return True
+
+    def run_speed_module(self):
+        if self.busy or not self._require_video():
+            return
+        corners = self.manual_corners
+        if corners is None:
+            try:
+                from video_pipeline import load_calib, DEFAULT_CALIB
+                c = load_calib(DEFAULT_CALIB)
+                corners = c.tolist() if c is not None else None
+            except Exception:
+                corners = None
+        if corners is None:
+            messagebox.showinfo("需要先标定",
+                                "速度换算需要球场四点。请先点「手动标定球场」，或在「判罚（实验）→ 完整判罚流程」里标定一次。")
+            return
+        self.busy = True
+        self._toggle_buttons(False)
+        self.status.config(text="轨迹与速度分析中…", fg=C_WARN)
+        threading.Thread(target=self._worker_speed, args=(corners,), daemon=True).start()
+
+    def _worker_speed(self, corners):
+        try:
+            from modules.track_speed import analyze_speed
+            res = analyze_speed(self.video_path, corners=corners,
+                                max_frames=self._frames(), log=lambda m: self.q.put(("log", m)))
+            self.out_dir = res.get("out_dir")
+            if res.get("annotated_video"):
+                self.annotated = res["annotated_video"]
+                self.q.put(("log", f"  球速 平均 {res['speed_mps']['avg_kmh']} km/h / "
+                                   f"峰值 {res['speed_mps']['peak_kmh']} km/h"))
+            self.q.put(("done", res))
+        except Exception:
+            self.q.put(("log", "✗ 速度模块异常：\n" + traceback.format_exc()))
+            self.q.put(("done", {"ok": False}))
+
+    def run_pose_module(self):
+        if self.busy or not self._require_video():
+            return
+        self.busy = True
+        self._toggle_buttons(False)
+        self.status.config(text="姿态检测中…", fg=C_WARN)
+        threading.Thread(target=self._worker_pose, daemon=True).start()
+
+    def _worker_pose(self):
+        try:
+            from modules.pose import analyze_pose
+            res = analyze_pose(self.video_path, max_frames=self._frames(),
+                               roi=self._pose_roi(), log=lambda m: self.q.put(("log", m)))
+            self.out_dir = res.get("out_dir")
+            if res.get("out_dir"):
+                self.annotated = os.path.join(res["out_dir"], "pose.mp4")
+                prev = os.path.join(res["out_dir"], "pose.mp4")
+                if os.path.exists(prev):
+                    self.q.put(("log", "  姿态视频已生成，可点「播放标注视频」查看"))
+            self.q.put(("done", res))
+        except Exception:
+            self.q.put(("log", "✗ 姿态模块异常：\n" + traceback.format_exc()))
+            self.q.put(("done", {"ok": False}))
+
+    def _frames(self) -> int:
+        try:
+            return int(self.var_frames.get() or 300)
+        except ValueError:
+            return 300
+
+    def _pose_roi(self):
+        """姿态检测 ROI：默认画面中部（去掉观众席/记分牌）。"""
+        try:
+            import cv2
+            cap = cv2.VideoCapture(self.video_path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            return [int(w * 0.12), int(h * 0.25), int(w * 0.88), h]
+        except Exception:
+            return None
+
     def _build_ui(self):
         # 顶部标题
         head = tk.Frame(self.root, bg=C_BG)
