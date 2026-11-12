@@ -151,6 +151,21 @@ def auto_detect_preview(image):
     fixed_size = (1080, 720)
     base_image = cv2.resize(image, fixed_size)
 
+    # —— 无头/自动化：可直接用环境变量注入四角（原始分辨率坐标）——
+    _env_corners = os.environ.get("GB_AUTO_CORNERS", "").strip()
+    if _env_corners:
+        try:
+            pts = [[float(v) for v in pair.split(",")]
+                   for pair in _env_corners.replace(" ", "").split(";") if pair]
+            if len(pts) == 4:
+                roi = compute_expanded_roi(pts, image.shape)
+                cm = CourtMapper(pts)
+                _, mh = cm.draw_court_overlay(image)
+                print(f"[GB_AUTO_CORNERS] 使用注入的四角: {pts}")
+                return pts, roi, int(mh)
+        except Exception as _e:
+            print(f"[GB_AUTO_CORNERS] 解析失败: {_e}")
+
     auto_corners, _line_mask, auto_debug = auto_detect_court_corners(base_image)
     if auto_corners:
         roi_corners = compute_expanded_roi(auto_corners, base_image.shape)
@@ -216,6 +231,21 @@ def annotate_court(image, auto_preview_path=None):
     fixed_size = (1080, 720)
     base_image = cv2.resize(image, fixed_size)
 
+    # —— 无头/自动化：可直接用环境变量注入四角（原始分辨率坐标）——
+    _env_corners = os.environ.get("GB_AUTO_CORNERS", "").strip()
+    if _env_corners:
+        try:
+            pts = [[float(v) for v in pair.split(",")]
+                   for pair in _env_corners.replace(" ", "").split(";") if pair]
+            if len(pts) == 4:
+                roi = compute_expanded_roi(pts, image.shape)
+                cm = CourtMapper(pts)
+                _, mh = cm.draw_court_overlay(image)
+                print(f"[GB_AUTO_CORNERS] 使用注入的四角: {pts}")
+                return pts, roi, int(mh)
+        except Exception as _e:
+            print(f"[GB_AUTO_CORNERS] 解析失败: {_e}")
+
     auto_corners, _line_mask, auto_debug = auto_detect_court_corners(base_image)
     if auto_corners:
         auto_roi_corners = compute_expanded_roi(auto_corners, base_image.shape)
@@ -255,6 +285,12 @@ def annotate_court(image, auto_preview_path=None):
     elif auto_preview_path:
         cv2.imwrite(auto_preview_path, render_auto_court_preview(base_image, None, None, auto_debug))
         print(f"No reliable auto court boundary found. Debug preview saved: {auto_preview_path}")
+        if os.environ.get("GB_AUTO_ACCEPT") == "1":
+            raise RuntimeError(
+                "自动标定失败且处于非交互模式。请任选其一：\n"
+                "  1) 用 --template-path 指定一张球场完整的截图；\n"
+                "  2) 设环境变量 GB_AUTO_CORNERS=\"x1,y1;x2,y2;x3,y3;x4,y4\" 直接给四角；\n"
+                "  3) 直接跑 main.py（不加 GB_AUTO_ACCEPT）用鼠标点四个角。")
 
     corners = []
     mid_height = [680]

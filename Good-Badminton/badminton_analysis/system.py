@@ -395,26 +395,43 @@ class BadmintonAnalysisSystem:
                 )
             return self.template_path
 
+        # 无模板时自动选帧（不弹对话框）：
+        # 采样若干帧，取"与其他帧平均相似度最高"的那帧（medoid）当模板。
+        # 这样整帧模板匹配 is_court_view 对所有正常机位画面都能过阈值，
+        # 避免抽到观众席/回放特写导致整片被判"非球场"而输出空视频。
+        import numpy as _np
         try:
-            root = tk.Tk()
-            root.withdraw()
-            template_path = filedialog.askopenfilename(
-                title="Select court template image",
-                filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp")]
-            )
-            root.destroy()
+            auto_dir = getattr(self, "save_dir", None) or "."
+            os.makedirs(auto_dir, exist_ok=True)
+            auto_path = os.path.join(auto_dir, f"auto_template_{self.video_name}.jpg")
+            _cap = cv2.VideoCapture(self.video_path)
+            _total = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            ratios = (0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75)
+            idxs = [int(_total * r) for r in ratios]
+            frames, smalls = [], []
+            for i in idxs:
+                _cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, i))
+                ok, f = _cap.read()
+                if ok and f is not None:
+                    frames.append(f)
+                    smalls.append(cv2.cvtColor(cv2.resize(f, (320, 180)), cv2.COLOR_BGR2GRAY))
+            _cap.release()
+            if smalls:
+                n = len(smalls)
+                sim = _np.zeros((n, n))
+                for a in range(n):
+                    for b in range(a + 1, n):
+                        v = float(_np.max(cv2.matchTemplate(smalls[a], smalls[b],
+                                                            cv2.TM_CCOEFF_NORMED)))
+                        sim[a, b] = sim[b, a] = v
+                best = int(_np.argmax(sim.mean(axis=1)))
+                cv2.imwrite(auto_path, frames[best])
+                print(f"[模板] 自动选帧：第 {idxs[best]} 帧（平均相似度 {sim[best].mean():.2f}）")
+                return auto_path
         except Exception as exc:
-            raise RuntimeError(
-                "Unable to open the template picker. In headless environments, "
-                "pass a court template image path with --template-path."
-            ) from exc
+            print(f"[模板] 自动选帧失败: {exc}")
 
-        if not template_path:
-            raise RuntimeError(
-                "No court template image selected. Pass --template-path to run "
-                "without the file picker."
-            )
-        return template_path
+        raise RuntimeError("未能确定球场模板图，请用 --template-path 指定一张该视频的截图")
 
     def _load_template(self, template_path, cap):
         """Load and resize the court template image."""
