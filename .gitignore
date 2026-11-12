@@ -40,3 +40,5 @@ third_party/tn3_ckpts*
 third_party/pred_*
 third_party/clip6s.mp4
 third_party/README_WeightFetch.md.lnk
+third_party/upstream_gb/
+third_party/upstream_gb.zip
