@@ -31,6 +31,8 @@ import cv2
 import numpy as np
 
 from landing_judge import CourtJudge
+from track_refine import (refine_tracks, template_recover,
+                          coverage as track_coverage, fill_ratio)
 import court_config as CC
 
 try:
@@ -273,7 +275,7 @@ class YoloBallDetector:
     DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "weights", "yolo11s-ball.pt")
 
-    def __init__(self, weights: Optional[str] = None, conf: float = 0.15,
+    def __init__(self, weights: Optional[str] = None, conf: float = 0.25,
                  imgsz: int = 1280, device: str = "cpu", max_per_frame: int = 8):
         from ultralytics import YOLO   # 延迟导入：没装 ultralytics 时不影响运动检测模式
         w = weights or self.DEFAULT_WEIGHTS
@@ -353,8 +355,11 @@ def parabola_fit_score(track, min_len: int = 8) -> float:
 
 
 def pick_main_track(tracks, min_len: int = 6, max_len: int = 120,
+                    W_img: float = 1280.0, H_img: float = 720.0,
                     min_disp: float = 30.0, min_r2: float = 0.35,
-                    log: Optional[Callable] = None):
+                    log: Optional[Callable] = None,
+                    in_court_fn: Optional[Callable] = None,
+                    min_in_court: float = 0.6):
     """挑主轨迹：抛物线拟合度 × 长度 × 平均速度 综合打分。
 
     真实场景下（多球员/观众/镜头抖动）会产生大量干扰轨迹，因此加三重硬门限：
@@ -368,6 +373,26 @@ def pick_main_track(tracks, min_len: int = 6, max_len: int = 120,
     for t in tracks:
         if not (min_len <= len(t) <= max_len):
             continue
+        # 关键约束：比赛中的球绝大多数时间在球场（含小幅边距）内。
+        # 不满足的轨迹多为观众/裁判/广告牌等误检，直接剔除。
+        # 物理常识：羽毛球单次飞行的路径长度不可能远超场地在画面中的尺度
+        diag = float(np.hypot(W_img, H_img))
+        path = 0.0
+        for (f0, x0, y0), (f1, x1, y1) in zip(t, t[1:]):
+            path += float(np.hypot(x1 - x0, y1 - y0))
+        if diag and path > 5.0 * diag:
+            if log:
+                log(f"  [轨迹] 剔除一条路径长度 {path:.0f}px 的轨迹（超过 5×画面对角线，"
+                    "几乎必为场外移动目标）")
+            continue
+        if in_court_fn is not None:
+            inside = sum(1 for p in t if in_court_fn(p[1], p[2]))
+            ratio = inside / max(len(t), 1)
+            if ratio < min_in_court:
+                if log:
+                    log(f"  [轨迹] 剔除一条场内占比仅 {ratio*100:.0f}% 的轨迹"
+                        f"（长度 {len(t)}，多为场外误检）")
+                continue
         disp = float(np.hypot(t[-1][1] - t[0][1], t[-1][2] - t[0][2]))
         if disp < min_disp:
             continue
@@ -506,7 +531,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   manual_corners: Optional[List[List[float]]] = None,
                   detector: str = "auto",
                   calib_file: Optional[str] = None,
-                  reuse_calib: bool = False) -> Dict:
+                  reuse_calib: bool = False,
+                  tracker: str = "refined") -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -594,6 +620,7 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     prev_gray = None
     per_frame: List[List[Tuple[float, float, float]]] = []
     keep_frames: List[np.ndarray] = []
+    gray_keep: List[np.ndarray] = []
     use_yolo = False
     if detector in ("auto", "yolo") and YoloBallDetector.is_available():
         try:
@@ -621,6 +648,7 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         per_frame.append(det.detect(frame, gray) if use_yolo else det.detect(prev_gray, gray))
         prev_gray = gray
         keep_frames.append(frame)
+        gray_keep.append(gray)
         fi += 1
         if n_total and n_total > 60:
             prog = fi / float(min(n_total, max_frames or n_total))
@@ -630,12 +658,50 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     cap.release()
     n = len(per_frame)
     n_cand = sum(len(p) for p in per_frame)
-    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（{'YOLO 球检测' if use_yolo else '背景建模+帧差双路'}）")
-    result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand, "detector": "yolo" if use_yolo else "motion"}
+    det_cov_before = sum(1 for p in per_frame if p) / max(n, 1)
+    if tracker == "refined" and gray_keep:
+        per_frame, n_added = template_recover(per_frame, gray_keep)
+        if n_added:
+            n_cand = sum(len(p) for p in per_frame)
+            log(f"  [检测] 模板补检 +{n_added} 点（漏检帧找回）")
+    det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
+    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（{'YOLO 球检测' if use_yolo else '背景建模+帧差双路'}）"
+        f"；有检出帧占比 {det_cov_before*100:.0f}% → {det_cov_after*100:.0f}%")
+    result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand,
+                                  "detector": "yolo" if use_yolo else "motion",
+                                  "frame_coverage_before": round(det_cov_before, 3),
+                                  "frame_coverage": round(det_cov_after, 3)}
 
-    # ---- 3. 轨迹串联 + 抛物线拟合筛选 ----
-    tracks = link_tracks(per_frame)
-    main_track, score, r2 = pick_main_track(tracks, log=log)
+    # ---- 3. 轨迹串联（NN 基线 vs 时序补全）+ 抛物线筛选 ----
+    in_court_fn = None
+    if H is not None:
+        margin_x, margin_y = 1.0, 1.5   # 允许球出界一小段（界外球也是球）
+
+        def in_court_fn(px, py, _H=H, _mx=margin_x, _my=margin_y):
+            cx_, cy_ = img_to_court(_H, (px, py))
+            return (-_mx <= cx_ <= CW + _mx) and (-_my <= cy_ <= CL + _my)
+
+    raw_tracks = link_tracks(per_frame)
+    raw_best, _s0, _r0 = pick_main_track(raw_tracks, W_img=float(w), H_img=float(h),
+                                        in_court_fn=in_court_fn)
+    raw_cov = 0.0
+    if raw_best:
+        span = raw_best[-1][0] - raw_best[0][0] + 1
+        raw_cov = len({p[0] for p in raw_best}) / max(span, 1)
+    result["stages"]["track_nn"] = {"len": len(raw_best) if raw_best else 0,
+                                    "coverage": round(raw_cov, 3)}
+
+    if tracker == "refined":
+        ref_tracks = refine_tracks(per_frame, (int(w), int(h)))
+        tracks = [[(f, x, y) for f, x, y, _filled in t] for t in ref_tracks]
+        log(f"  [追踪] 时序补全：{len(ref_tracks)} 条轨迹"
+            f"（NN 基线 {len(raw_tracks)} 条）")
+        tracks = tracks or raw_tracks
+    else:
+        tracks = raw_tracks
+
+    main_track, score, r2 = pick_main_track(tracks, log=log, W_img=float(w), H_img=float(h),
+                                            in_court_fn=in_court_fn)
 
     # 结果驱动回退：YOLO 模式下轨迹不成形（如合成/非常规画面），补跑运动检测重试一次
     if (main_track is None or len(main_track) < 4) and use_yolo and detector == "auto":
@@ -648,7 +714,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
             prev_gray = gray
         use_yolo = False
         tracks = link_tracks(per_frame)
-        main_track, score, r2 = pick_main_track(tracks, log=log)
+        main_track, score, r2 = pick_main_track(tracks, log=log, W_img=float(w), H_img=float(h),
+                                            in_court_fn=in_court_fn)
         result["stages"]["detect"]["fallback"] = "motion"
 
     if main_track is None or len(main_track) < 4:
@@ -658,9 +725,15 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
         return _finish(result, out_dir, None, log, t0)
 
     log(f"  [轨迹] 候选轨迹 {len(tracks)} 条，主轨迹 {len(main_track)} 点（抛物线 R²={r2:.2f}）")
+    span = main_track[-1][0] - main_track[0][0] + 1
+    cov = len({p[0] for p in main_track}) / max(span, 1)
+    log(f"  [追踪] 主轨迹覆盖率 {cov*100:.0f}%（{len(main_track)} 点 / 跨度 {span} 帧，"
+        f"NN 基线 {raw_cov*100:.0f}%）")
     result["stages"]["track"] = {"ok": True, "tracks": len(tracks),
                                  "main_len": len(main_track),
-                                 "score": round(score, 1), "parabola_r2": round(r2, 3)}
+                                 "score": round(score, 1), "parabola_r2": round(r2, 3),
+                                 "coverage": round(cov, 3),
+                                 "coverage_nn": round(raw_cov, 3)}
 
     # ---- 4. 落点：观测值 + 外推值双重估计 ----
     landing = None
@@ -902,6 +975,8 @@ if __name__ == "__main__":
                     help="复用已保存标定（同机位同场地时才用，可跳过检测）")
     ap.add_argument("--no-reuse-calib", action="store_true",
                     help="忽略已保存标定，强制重新检测/手动标定")
+    ap.add_argument("--tracker", default="refined", choices=["refined", "nn"],
+                    help="轨迹追踪：refined=时序补全(默认)，nn=简单最近邻")
     ap.add_argument("--detector", default="auto", choices=["auto", "motion", "yolo"],
                     help="检测器：auto=有YOLO权重就用YOLO")
     ap.add_argument("--corners", type=str, default=None,
@@ -922,4 +997,5 @@ if __name__ == "__main__":
     analyze_video(vp, mode=args.mode, max_frames=args.max_frames,
                   manual_corners=mc, detector=args.detector,
                   calib_file=None if args.no_reuse_calib else (args.calib or None),
-                  reuse_calib=bool(args.reuse_calib))
+                  reuse_calib=bool(args.reuse_calib),
+                  tracker=args.tracker)

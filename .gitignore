@@ -34,3 +34,5 @@ outputs/court_3d.png
 _debug_outputs/
 badminton-videos-backup/
 samples/
+third_party/TrackNetV3/
+third_party/*.zip
