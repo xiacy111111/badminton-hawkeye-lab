@@ -82,6 +82,9 @@ class HawkEyeApp:
         menubar = tk.Menu(self.root)
 
         m_mod = tk.Menu(menubar, tearoff=0)
+        m_mod.add_command(label="★ 完整分析（统计+骨架+轨迹）· 推荐",
+                          command=self.run_upstream_analysis)
+        m_mod.add_separator()
         m_mod.add_command(label="轨迹与速度检测", command=self.run_speed_module)
         m_mod.add_command(label="运动员姿态检测", command=self.run_pose_module)
         menubar.add_cascade(label="模块", menu=m_mod)
@@ -108,6 +111,40 @@ class HawkEyeApp:
                 except Exception:
                     pass
         messagebox.showinfo("提示", "未找到 使用说明.md")
+
+    # ── 原版完整分析（主推：左侧统计面板 + 骨架 + 轨迹 + 战术小窗）──
+    def run_upstream_analysis(self):
+        """调用一键脚本（外部控制台窗口），跑完自动打开成品目录。
+        不在 GUI 里内嵌子进程：长任务在独立控制台里，进度可见、不会卡界面。"""
+        if not self._require_video():
+            return
+        name = os.path.splitext(os.path.basename(self.video_path))[0]
+        done_dir = BASE.parent / "交付成品" / name
+        # 已有成品 → 直接播放，省时间
+        if done_dir.is_dir():
+            vids = [f for f in sorted(os.listdir(done_dir))
+                    if f.startswith("detect_") and f.endswith(".mp4")
+                    and not f.startswith("detect_judged")]
+            if vids:
+                self.annotated = str(done_dir / vids[0])
+                self._log(f"复用已有成品：{self.annotated}", "ok")
+                try:
+                    os.startfile(self.annotated)
+                except Exception as e:
+                    self._log(f"打开失败：{e}", "err")
+                return
+        bat = BASE / "一键分析.bat"
+        if not bat.exists():
+            messagebox.showerror("缺少脚本", f"未找到 {bat}")
+            return
+        self._log("▶ 已在独立窗口启动分析（进度看那个黑窗口），跑完会自动打开成品目录", "ok")
+        self._log("  提示：若自动标定失败，控制台会提示用 GB_AUTO_CORNERS 给四角", "dim")
+        try:
+            os.startfile(str(bat), "open", str(self.video_path))
+        except Exception:
+            # startfile 无法直接传参时，退化为 cmd 调用
+            import subprocess
+            subprocess.Popen(["cmd", "/c", str(bat), self.video_path], cwd=str(BASE))
 
     # ── 模块入口 ────────────────────────────────
     def _require_video(self) -> bool:
@@ -545,6 +582,17 @@ class HawkEyeApp:
             subprocess.Popen(["explorer", target])
 
     def open_video(self):
+        # 若成品目录里已有原版输出，优先播放它（才是带统计面板/骨架的版本）
+        try:
+            name = os.path.splitext(os.path.basename(self.video_path or ""))[0]
+            cand = BASE.parent / "交付成品" / name
+            if cand.is_dir():
+                for f in sorted(os.listdir(cand)):
+                    if f.startswith("detect_") and f.endswith(".mp4"):
+                        self.annotated = str(cand / f)
+                        break
+        except Exception:
+            pass
         if self.annotated and os.path.exists(self.annotated):
             try:
                 os.startfile(self.annotated)
