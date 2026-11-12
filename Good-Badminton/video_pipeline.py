@@ -478,6 +478,28 @@ def load_calib(path: str = DEFAULT_CALIB):
     return None
 
 
+def load_ball_csv(csv_path: str, scale_x: float = 1.0, scale_y: float = 1.0,
+                  min_vis: int = 1):
+    """读取 TrackNetV3 输出的逐帧球坐标 CSV（Frame,Visibility,X,Y）→ 逐帧检测列表。"""
+    import csv as _csv
+    per = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            try:
+                fi = int(float(row["Frame"]))
+                vis = int(float(row.get("Visibility", 1)))
+                x = float(row["X"]) * scale_x
+                y = float(row["Y"]) * scale_y
+            except Exception:
+                continue
+            if vis < min_vis:
+                continue
+            per.setdefault(fi, []).append((x, y, 1.0))
+    if not per:
+        return []
+    return [per.get(i, []) for i in range(max(per) + 1)]
+
+
 def _ffmpeg_path() -> Optional[str]:
     for name in ("ffmpeg", "ffmpeg.exe"):
         try:
@@ -532,7 +554,8 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
                   detector: str = "auto",
                   calib_file: Optional[str] = None,
                   reuse_calib: bool = False,
-                  tracker: str = "refined") -> Dict:
+                  tracker: str = "refined",
+                  ball_csv: Optional[str] = None) -> Dict:
     t0 = time.time()
     video_path = str(video_path)
     if out_dir is None:
@@ -615,62 +638,89 @@ def analyze_video(video_path: str, out_dir: Optional[str] = None,
     else:
         result["stages"]["court"] = {"ok": False, **court_info}
 
-    # ---- 2. 逐帧运动检测（背景建模 + 帧差，带进度） ----
-    cap = cv2.VideoCapture(vp)
-    prev_gray = None
+    # ---- 2. 逐帧检测：TrackNet CSV 优先，否则 YOLO / 运动检测 ----
     per_frame: List[List[Tuple[float, float, float]]] = []
     keep_frames: List[np.ndarray] = []
     gray_keep: List[np.ndarray] = []
     use_yolo = False
-    if detector in ("auto", "yolo") and YoloBallDetector.is_available():
-        try:
-            det = YoloBallDetector()
-            use_yolo = True
-            log(f"  [检测] 使用 YOLO 球检测模型（imgsz={det.imgsz}, conf={det.conf}）")
-        except Exception as e:
-            log(f"  [检测] YOLO 初始化失败（{e}），回退运动检测")
-            det = MotionDetector()
+    det_cov_before = det_cov_after = 0.0
+
+    if ball_csv and os.path.exists(ball_csv):
+        # TrackNetV3 的 predict.py 写出 CSV 时已乘过 img_scaler（w/512, h/288），
+        # 即坐标已经是原视频分辨率，这里不要再缩放（曾因此把坐标放大 2 倍而全部出界）。
+        sx = sy = 1.0
+        per_frame = load_ball_csv(ball_csv, sx, sy)
+        cap0 = cv2.VideoCapture(vp)
+        while len(keep_frames) < len(per_frame):
+            ok, fr = cap0.read()
+            if not ok:
+                break
+            keep_frames.append(fr)
+            gray_keep.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
+        cap0.release()
+        while len(per_frame) < len(keep_frames):
+            per_frame.append([])
+        n = len(per_frame)
+        n_cand = sum(len(p) for p in per_frame)
+        det_cov_before = det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
+        log(f"  [检测] 使用 TrackNetV3 CSV：{n} 帧，候选点 {n_cand} 个，"
+            f"有检出帧占比 {det_cov_after*100:.0f}%（坐标已按 {sx:.2f}× 缩放）")
+        result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand,
+                                      "detector": "tracknet_csv",
+                                      "frame_coverage": round(det_cov_after, 3)}
     else:
-        det = MotionDetector()
-        if detector == "yolo":
-            log("  [检测] 未找到 weights/yolo11s-ball.pt 或未安装 ultralytics，回退运动检测")
+        cap = cv2.VideoCapture(vp)
+        prev_gray = None
+        if detector in ("auto", "yolo") and YoloBallDetector.is_available():
+            try:
+                det = YoloBallDetector()
+                use_yolo = True
+                log(f"  [检测] 使用 YOLO 球检测模型（imgsz={det.imgsz}, conf={det.conf}）")
+            except Exception as e:
+                log(f"  [检测] YOLO 初始化失败（{e}），回退运动检测")
+                det = MotionDetector()
         else:
-            log("  [检测] 使用运动检测（背景建模+帧差）")
-    fi = 0
-    next_report = 0.1
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if max_frames and fi >= max_frames:
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        per_frame.append(det.detect(frame, gray) if use_yolo else det.detect(prev_gray, gray))
-        prev_gray = gray
-        keep_frames.append(frame)
-        gray_keep.append(gray)
-        fi += 1
-        if n_total and n_total > 60:
-            prog = fi / float(min(n_total, max_frames or n_total))
-            if prog >= next_report:
-                log(f"  [检测] 进度 {prog*100:.0f}%  ({fi} 帧)")
-                next_report += 0.25
-    cap.release()
-    n = len(per_frame)
-    n_cand = sum(len(p) for p in per_frame)
-    det_cov_before = sum(1 for p in per_frame if p) / max(n, 1)
-    if tracker == "refined" and gray_keep:
-        per_frame, n_added = template_recover(per_frame, gray_keep)
-        if n_added:
-            n_cand = sum(len(p) for p in per_frame)
-            log(f"  [检测] 模板补检 +{n_added} 点（漏检帧找回）")
-    det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
-    log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个（{'YOLO 球检测' if use_yolo else '背景建模+帧差双路'}）"
-        f"；有检出帧占比 {det_cov_before*100:.0f}% → {det_cov_after*100:.0f}%")
-    result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand,
-                                  "detector": "yolo" if use_yolo else "motion",
-                                  "frame_coverage_before": round(det_cov_before, 3),
-                                  "frame_coverage": round(det_cov_after, 3)}
+            det = MotionDetector()
+            if detector == "yolo":
+                log("  [检测] 未找到 weights/yolo11s-ball.pt 或未安装 ultralytics，回退运动检测")
+            else:
+                log("  [检测] 使用运动检测（背景建模+帧差）")
+        fi = 0
+        next_report = 0.1
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if max_frames and fi >= max_frames:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            per_frame.append(det.detect(frame, gray) if use_yolo else det.detect(prev_gray, gray))
+            prev_gray = gray
+            keep_frames.append(frame)
+            gray_keep.append(gray)
+            fi += 1
+            if n_total and n_total > 60:
+                prog = fi / float(min(n_total, max_frames or n_total))
+                if prog >= next_report:
+                    log(f"  [检测] 进度 {prog*100:.0f}%  ({fi} 帧)")
+                    next_report += 0.25
+        cap.release()
+        n = len(per_frame)
+        n_cand = sum(len(p) for p in per_frame)
+        det_cov_before = sum(1 for p in per_frame if p) / max(n, 1)
+        if tracker == "refined" and gray_keep:
+            per_frame, n_added = template_recover(per_frame, gray_keep)
+            if n_added:
+                n_cand = sum(len(p) for p in per_frame)
+                log(f"  [检测] 模板补检 +{n_added} 点（漏检帧找回）")
+        det_cov_after = sum(1 for p in per_frame if p) / max(n, 1)
+        log(f"  [检测] 处理 {n} 帧，候选点 {n_cand} 个"
+            f"（{'YOLO 球检测' if use_yolo else '背景建模+帧差双路'}）"
+            f"；有检出帧占比 {det_cov_before*100:.0f}% → {det_cov_after*100:.0f}%")
+        result["stages"]["detect"] = {"ok": n > 0, "frames": n, "candidates": n_cand,
+                                      "detector": "yolo" if use_yolo else "motion",
+                                      "frame_coverage_before": round(det_cov_before, 3),
+                                      "frame_coverage": round(det_cov_after, 3)}
 
     # ---- 3. 轨迹串联（NN 基线 vs 时序补全）+ 抛物线筛选 ----
     in_court_fn = None
@@ -975,6 +1025,8 @@ if __name__ == "__main__":
                     help="复用已保存标定（同机位同场地时才用，可跳过检测）")
     ap.add_argument("--no-reuse-calib", action="store_true",
                     help="忽略已保存标定，强制重新检测/手动标定")
+    ap.add_argument("--ball-csv", default=None,
+                    help="TrackNetV3 输出的逐帧球坐标 CSV（提供则跳过模型检测）")
     ap.add_argument("--tracker", default="refined", choices=["refined", "nn"],
                     help="轨迹追踪：refined=时序补全(默认)，nn=简单最近邻")
     ap.add_argument("--detector", default="auto", choices=["auto", "motion", "yolo"],
@@ -998,4 +1050,4 @@ if __name__ == "__main__":
                   manual_corners=mc, detector=args.detector,
                   calib_file=None if args.no_reuse_calib else (args.calib or None),
                   reuse_calib=bool(args.reuse_calib),
-                  tracker=args.tracker)
+                  tracker=args.tracker, ball_csv=args.ball_csv)

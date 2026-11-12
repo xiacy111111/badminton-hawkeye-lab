@@ -595,6 +595,43 @@ python video_pipeline.py 视频.mp4 --tracker nn        # 关掉补全，用于�
 TrackNetV3 代码已放在 `third_party/TrackNetV3/`（MIT），权重获取与接入步骤见
 `third_party/README_WeightFetch.md`；权重到位后可直接与本节方案做 A/B 对比。
 
+
+### 十一、TrackNetV3 已完整接入（2026-11-12）
+
+官方权重（125.5 MB）已获取并放置：`third_party/TrackNetV3/qaz812345-TrackNetV3-*/ckpts/`
+（`TrackNet_best.pt` 136 MB + `InpaintNet_best.pt` 6.3 MB）。
+
+```bash
+# 1) TrackNetV3 推理（CPU 上 180 帧约 45 秒）
+cd third_party/TrackNetV3/qaz812345-TrackNetV3-6eda442
+python predict.py --video_file ../clip6s.mp4 \
+       --tracknet_file ckpts/TrackNet_best.pt \
+       --inpaintnet_file ckpts/InpaintNet_best.pt \
+       --save_dir ../pred_clip6s
+
+# 2) 把预测 CSV 直接喂进本项目流水线（跳过 YOLO 检测）
+python video_pipeline.py ../third_party/TrackNetV3/clip6s.mp4 \
+       --ball-csv ../third_party/TrackNetV3/pred_clip6s/clip6s_ball.csv
+```
+
+**踩到的坑（已记录，避免重复）**
+- CSV 坐标**已经是原视频分辨率**：`predict.py` 写出时乘过 `img_scaler = (w/512, h/288)`，
+  再缩放一次会整体放大 2 倍、全部跑到场外；
+- 需要额外依赖：`parse`、`pycocotools`；
+- `--output_video` 会因缺 OpenH264 库失败，但不影响 CSV。
+
+**同一 6 秒片段（182 帧）的 A/B 实测**
+
+| 检测源 | 有检出帧占比 | 检测点数 | 说明 |
+|---|---|---|---|
+| YOLO（原始 conf=0.25） | 81% | 196 | 含部分误检（球员/鞋/白物） |
+| YOLO + 模板补检 | **97%** | 196+34 | 我们自己的工程补全 |
+| **TrackNetV3** | 84% | 152 | 时序模型，点更"干净"，但本项目素材上可见率未超过补全后的 YOLO |
+
+结论：**TrackNetV3 不是银弹**——在这两段素材上它的可见率（84%）低于「YOLO + 模板补检」（97%）。
+它的优势在轨迹点更干净（少误检）、抗遮挡更好；劣势是必须整段连续推理、CPU 慢（4 秒/16 帧）。
+下一步可做：TrackNet 与 YOLO 双源融合（取长补短），而不是二选一。
+
 覆盖：依赖 / RK4 终端速度 / 落地三重触发 + 兜底 / 场地判罚 / 全链路模拟 / 单视频流水线。
 当前状态：**6/6 PASS**（3D 误差 18.9mm，落点判罚正确，轨迹 R²=0.999）。
 

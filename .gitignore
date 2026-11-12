@@ -36,3 +36,7 @@ badminton-videos-backup/
 samples/
 third_party/TrackNetV3/
 third_party/*.zip
+third_party/tn3_ckpts*
+third_party/pred_*
+third_party/clip6s.mp4
+third_party/README_WeightFetch.md.lnk
